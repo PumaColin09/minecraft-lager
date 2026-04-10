@@ -163,31 +163,140 @@ local function classifyItemName(itemName)
     return "ores"
   end
 
-  local stoneWords = {
-    "stone", "cobblestone", "deepslate", "cobbled_deepslate", "blackstone", "basalt",
-    "andesite", "diorite", "granite", "tuff", "calcite", "dripstone", "netherrack",
-    "end_stone", "sandstone", "red_sandstone", "gravel", "flint", "slate", "limestone",
-    "marble", "scoria",
+  local stoneExact = {
+    stone = true,
+    cobblestone = true,
+    deepslate = true,
+    cobbled_deepslate = true,
+    blackstone = true,
+    basalt = true,
+    andesite = true,
+    diorite = true,
+    granite = true,
+    tuff = true,
+    calcite = true,
+    dripstone_block = true,
+    netherrack = true,
+    end_stone = true,
+    sandstone = true,
+    red_sandstone = true,
+    gravel = true,
+    flint = true,
+    limestone = true,
+    marble = true,
+    scoria = true,
+    slate = true,
+    smooth_stone = true,
   }
 
-  for _, word in ipairs(stoneWords) do
-    if base:find(word, 1, true) then
+  if stoneExact[base] then
+    return "stone"
+  end
+
+  local stoneParts = {
+    "cobblestone",
+    "deepslate",
+    "blackstone",
+    "basalt",
+    "andesite",
+    "diorite",
+    "granite",
+    "tuff",
+    "calcite",
+    "dripstone",
+    "netherrack",
+    "end_stone",
+    "sandstone",
+    "gravel",
+    "limestone",
+    "marble",
+    "scoria",
+    "slate",
+  }
+
+  for _, part in ipairs(stoneParts) do
+    if base:find(part, 1, true) then
       return "stone"
     end
   end
 
-  local woodWords = {
-    "_log", "_wood", "stripped_", "planks", "_stem", "_hyphae", "leaves",
-    "sapling", "bamboo", "mangrove_roots", "_boat", "chest_boat",
+  local woodParts = {
+    "_log",
+    "_wood",
+    "stripped_",
+    "planks",
+    "_stem",
+    "_hyphae",
+    "leaves",
+    "sapling",
+    "bamboo",
+    "mangrove_roots",
+    "_boat",
+    "chest_boat",
+    "_slab",
+    "_stairs",
+    "_door",
+    "_trapdoor",
+    "_fence",
+    "_fence_gate",
+    "_button",
+    "_pressure_plate",
+    "_sign",
+    "_hanging_sign",
   }
 
-  for _, word in ipairs(woodWords) do
-    if base:find(word, 1, true) then
+  for _, part in ipairs(woodParts) do
+    if base:find(part, 1, true) then
       return "wood"
     end
   end
 
   return nil
+end
+
+local function prettyModName(ns)
+  local map = {
+    create = "Create",
+    mekanism = "Mekanism",
+    farmersdelight = "Farmer's Delight",
+    supplementaries = "Supplementaries",
+    computercraft = "CC",
+    storagedrawers = "Storage Drawers",
+    thermal = "Thermal",
+    immersiveengineering = "Immersive Engineering",
+    ae2 = "Applied Energistics 2",
+  }
+
+  if map[ns] then
+    return map[ns]
+  end
+
+  ns = tostring(ns or ""):gsub("_", " ")
+  return (ns:gsub("(%a)([%w ]*)", function(a, b)
+    return a:upper() .. b:lower()
+  end))
+end
+
+local function buildDescription(detail)
+  if not detail then return "" end
+  local ns = namespaceOf(detail.name or "")
+
+  if detail.name == "minecraft:enchanted_book" and detail.enchantments and #detail.enchantments > 0 then
+    return detail.enchantments[1].displayName or ""
+  end
+
+  if detail.potionEffects and #detail.potionEffects > 0 then
+    return detail.potionEffects[1].displayName or ""
+  end
+
+  if ns ~= "minecraft" then
+    if detail.lore and #detail.lore > 0 then
+      return tostring(detail.lore[1])
+    end
+    return "[" .. prettyModName(ns) .. "]"
+  end
+
+  return ""
 end
 
 local function discoverPoolNames()
@@ -328,6 +437,7 @@ local function scanStorage()
             name = item.name,
             nbt = item.nbt,
             displayName = (detail and detail.displayName) or item.name,
+            desc = buildDescription(detail),
             count = 0,
             locs = {},
           }
@@ -573,14 +683,25 @@ local function redrawMonitor(page)
     local entry = state.order[startIndex + row - 1]
     local y = row + 1
     if y > h then break end
+
     if entry then
       local countText = formatCount(entry.count)
-      local leftWidth = math.max(1, w - #countText - 1)
+      local countWidth = #countText
+      local nameWidth = math.max(12, math.floor(w * 0.44))
+      local descWidth = math.max(0, w - nameWidth - countWidth - 3)
+
       m.setTextColor(colors.white)
       m.setCursorPos(1, y)
-      m.write(clip(entry.displayName, leftWidth))
+      m.write(clip(entry.displayName, nameWidth))
+
+      if descWidth > 0 then
+        m.setTextColor(colors.lightGray)
+        m.setCursorPos(nameWidth + 2, y)
+        m.write(clip(entry.desc or "", descWidth))
+      end
+
       m.setTextColor(colors.lime)
-      m.setCursorPos(w - #countText + 1, y)
+      m.setCursorPos(w - countWidth + 1, y)
       m.write(countText)
     end
   end
