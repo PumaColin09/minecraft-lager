@@ -1,1 +1,704 @@
-local IO_NAME="minecraft:barrel_0";local AUTO_STORAGE=true;local STORAGE_NAMES={};local MONITOR_NAME=nil;local MONITOR_SCALE=0.5;local SORT_INTERVAL=2;local SCAN_INTERVAL=5;local PAGE_INTERVAL=4;local SIDES={top=true,bottom=true,left=true,right=true,front=true,back=true};local state={ioName=nil,io=nil,storageNames={},monitor=nil,index={},order={},totalItems=0,totalStacks=0,lastScan=0,dirty=true};local function isSide(name)return SIDES[name]==true end;local function formatCount(n)local s=tostring(n)local out="" while #s>3 do out="."..s:sub(-3)..out s=s:sub(1,-4) end return s..out end;local function clip(text,maxLen)if maxLen<=0 then return "" end if #text<=maxLen then return text end if maxLen==1 then return text:sub(1,1) end return text:sub(1,maxLen-1)..">" end;local function outputStart()return math.floor(state.io.size()/2)+1 end;local function inputEnd()return outputStart()-1 end;local function entryKey(item)return item.name.."#"..(item.nbt or "") end;local function getMonitor()if MONITOR_NAME and MONITOR_NAME~="" then if peripheral.isPresent(MONITOR_NAME) and peripheral.hasType(MONITOR_NAME,"monitor") then return peripheral.wrap(MONITOR_NAME) end return nil end return peripheral.find("monitor") end;local function discoverStorageNames()if not AUTO_STORAGE then local out={} for i=1,#STORAGE_NAMES do out[#out+1]=STORAGE_NAMES[i] end return out end local out={} for _,name in ipairs(peripheral.getNames()) do if name~=IO_NAME and not isSide(name) and peripheral.hasType(name,"inventory") then out[#out+1]=name end end table.sort(out) return out end;local function setup()if not peripheral.isPresent(IO_NAME) then error("IO_NAME nicht gefunden: "..IO_NAME,0) end if not peripheral.hasType(IO_NAME,"inventory") then error("IO_NAME ist kein Inventar: "..IO_NAME,0) end state.ioName=IO_NAME;state.io=peripheral.wrap(IO_NAME);state.storageNames=discoverStorageNames();state.monitor=getMonitor();if #state.storageNames==0 then error("Keine Lager-Inventare gefunden. Prüfe Wired Modems/Kabel.",0) end if state.monitor then state.monitor.setTextScale(MONITOR_SCALE);state.monitor.setBackgroundColor(colors.black);state.monitor.setTextColor(colors.white) end end;local function scanStorage()local index={} local order={} local totalItems=0 local totalStacks=0 for _,invName in ipairs(state.storageNames) do local inv=peripheral.wrap(invName) if inv then for slot,item in pairs(inv.list()) do totalStacks=totalStacks+1 totalItems=totalItems+item.count local key=entryKey(item) local entry=index[key] if not entry then local detail=inv.getItemDetail(slot) entry={key=key,name=item.name,nbt=item.nbt,displayName=(detail and detail.displayName) or item.name,count=0,locs={}} index[key]=entry order[#order+1]=entry end entry.count=entry.count+item.count entry.locs[#entry.locs+1]={inv=invName,slot=slot,count=item.count} end end end table.sort(order,function(a,b)local ad=a.displayName:lower() local bd=b.displayName:lower() if ad==bd then return a.name<b.name end return ad<bd end) state.index=index;state.order=order;state.totalItems=totalItems;state.totalStacks=totalStacks;state.lastScan=os.epoch("utc");state.dirty=false end;local function ensureFresh(force)if force or state.dirty or (os.epoch("utc")-state.lastScan)>=(SCAN_INTERVAL*1000) then scanStorage() end end;local function sortInput()local movedAny=false local io=state.io for slot=1,inputEnd() do local item=io.getItemDetail(slot) while item do local movedThisRound=false for _,target in ipairs(state.storageNames) do local ok,moved=pcall(io.pushItems,target,slot) if ok and moved and moved>0 then movedAny=true movedThisRound=true break end end if not movedThisRound then break end item=io.getItemDetail(slot) end end if movedAny then state.dirty=true end end;local function moveIntoOutput(fromInvName,fromSlot,amount)local inv=peripheral.wrap(fromInvName) if not inv then return 0 end local moved=0 for toSlot=outputStart(),state.io.size() do local remaining=amount-moved if remaining<=0 then break end local ok,sent=pcall(inv.pushItems,state.ioName,fromSlot,remaining,toSlot) if ok and sent and sent>0 then moved=moved+sent end end return moved end;local function findMatches(query)ensureFresh(false) local q=query:lower() local exact={} local fuzzy={} for _,entry in ipairs(state.order) do local name=entry.name:lower() local disp=entry.displayName:lower() if name==q or disp==q then exact[#exact+1]=entry end end if #exact>0 then return exact end for _,entry in ipairs(state.order) do local name=entry.name:lower() local disp=entry.displayName:lower() if name:find(q,1,true) or disp:find(q,1,true) then fuzzy[#fuzzy+1]=entry end end return fuzzy end;local function printEntries(entries,maxLines)maxLines=maxLines or #entries for i=1,math.min(#entries,maxLines) do local e=entries[i] print(("%2d) %s  [%s]  x%s"):format(i,e.displayName,e.name,formatCount(e.count))) end if #entries>maxLines then print(("... %d weitere Treffer"):format(#entries-maxLines)) end end;local function withdraw(query,amount)ensureFresh(true) local matches=findMatches(query) if #matches==0 then print("Nichts gefunden: "..query) return end if #matches>1 then print("Mehrdeutig. Nimm einen genaueren Namen:") printEntries(matches,12) return end local entry=matches[1] local remaining=amount for _,loc in ipairs(entry.locs) do if remaining<=0 then break end local moved=moveIntoOutput(loc.inv,loc.slot,remaining) remaining=remaining-moved end local movedTotal=amount-remaining if movedTotal>0 then state.dirty=true ensureFresh(true) end print(("Ausgegeben: %d x %s"):format(movedTotal,entry.displayName)) if remaining>0 then print(("Nicht mehr vorhanden oder Output-Haelfte voll: %d"):format(remaining)) end end;local function listItems(filter)ensureFresh(false) if not filter or filter=="" then print(("Geladene Typen: %d | Gesamtitems: %s"):format(#state.order,formatCount(state.totalItems))) printEntries(state.order,20) return end local hits=findMatches(filter) if #hits==0 then print("Keine Treffer fuer: "..filter) return end print(("Treffer fuer '%s': %d"):format(filter,#hits)) printEntries(hits,20) end;local function printStatus()print("I/O-Kiste: "..state.ioName) print("Input-Slots: 1-"..inputEnd()) print("Output-Slots: "..outputStart().."-"..state.io.size()) print("Lager-Inventare: "..#state.storageNames) if state.monitor then print("Monitor: verbunden") else print("Monitor: keiner") end end;local function redrawMonitor(page)local m=state.monitor if not m then return 1,1 end local w,h=m.getSize() local lines=math.max(1,h-2) local pages=math.max(1,math.ceil(#state.order/lines)) if page>pages then page=1 end m.setBackgroundColor(colors.black) m.clear() m.setTextColor(colors.yellow) m.setCursorPos(1,1) m.write(clip(("Lager %d/%d"):format(page,pages),w)) local startIndex=(page-1)*lines+1 for row=1,lines do local entry=state.order[startIndex+row-1] local y=row+1 if y>=h then break end if entry then local countText=formatCount(entry.count) local leftWidth=math.max(1,w-#countText-1) m.setTextColor(colors.white) m.setCursorPos(1,y) m.write(clip(entry.displayName,leftWidth)) m.setTextColor(colors.lime) m.setCursorPos(w-#countText+1,y) m.write(countText) end end m.setTextColor(colors.cyan) m.setCursorPos(1,h) m.write(clip(("%d Typen | %s Items"):format(#state.order,formatCount(state.totalItems)),w)) return page,pages end;local function monitorLoop()local page=1 while true do state.monitor=getMonitor() if state.monitor then state.monitor.setTextScale(MONITOR_SCALE);state.monitor.setBackgroundColor(colors.black);state.monitor.setTextColor(colors.white) end ensureFresh(false) if state.monitor then local currentPage,pageCount=redrawMonitor(page) page=currentPage+1 if page>pageCount then page=1 end end sleep(PAGE_INTERVAL) end end;local function sorterLoop()while true do sortInput() sleep(SORT_INTERVAL) end end;local function parseQueryAndAmount(args,startIndex)if #args<startIndex then return "",1 end local last=#args local amount=tonumber(args[#args]) if amount then last=#args-1 else amount=1 end if amount<1 then amount=1 end local query=table.concat(args," ",startIndex,last) return query,amount end;local function helpText()print("Befehle:") print("  hilfe") print("  status") print("  scan") print("  neu") print("  list [filter]") print("  hole <item oder teilname> [anzahl]") print("  stop") end;local function commandLoop()term.clear() term.setCursorPos(1,1) print("Lagersystem gestartet.") printStatus() print("") helpText() print("") while true do write("lager> ") local line=read() local args={} for part in line:gmatch("%S+") do args[#args+1]=part end local cmd=(args[1] or ""):lower() if cmd=="" then elseif cmd=="hilfe" then helpText() elseif cmd=="status" then printStatus() elseif cmd=="scan" then ensureFresh(true) print("Scan fertig.") elseif cmd=="neu" then setup() ensureFresh(true) print("Peripherie neu geladen.") printStatus() elseif cmd=="list" then local filter=table.concat(args," ",2) listItems(filter) elseif cmd=="hole" then local query,amount=parseQueryAndAmount(args,2) if query=="" then print("Benutzung: hole <item oder teilname> [anzahl]") else withdraw(query,amount) end elseif cmd=="stop" or cmd=="exit" then print("Programm beendet.") return else print("Unbekannter Befehl. 'hilfe' zeigt die Befehle.") end end end;setup();ensureFresh(true);parallel.waitForAny(commandLoop,function()parallel.waitForAll(sorterLoop,monitorLoop) end)
+local IO_NAME = nil
+local MONITOR_NAME = nil
+local MONITOR_SCALE = 0.5
+local SORT_INTERVAL = 1
+local SCAN_INTERVAL = 5
+local PAGE_INTERVAL = 4
+local MAP_FILE = "mod_map.txt"
+
+local SPECIAL_TARGETS = {
+  ores = nil,
+  stone = nil,
+  wood = nil,
+  overflow = nil,
+}
+
+local AUTO_MOD_POOL = true
+local MOD_POOL_NAMES = {
+  -- "create:item_vault_0",
+  -- "create:item_vault_1",
+  -- "minecraft:chest_3",
+  -- "minecraft:chest_4",
+}
+
+local state = {
+  ioName = nil,
+  io = nil,
+  monitor = nil,
+  poolNames = {},
+  storageNames = {},
+  modMap = {},
+  freePool = {},
+  index = {},
+  order = {},
+  totalItems = 0,
+  totalStacks = 0,
+  lastScan = 0,
+  dirty = true,
+}
+
+local SIDE_ORDER = { "top", "bottom", "left", "right", "front", "back" }
+
+local function sortedNames()
+  local names = peripheral.getNames()
+  table.sort(names)
+  return names
+end
+
+local function isInventory(name)
+  return name and peripheral.isPresent(name) and peripheral.hasType(name, "inventory")
+end
+
+local function uniqueList(list)
+  local out = {}
+  local seen = {}
+  for _, value in ipairs(list) do
+    if value and value ~= "" and not seen[value] then
+      seen[value] = true
+      out[#out + 1] = value
+    end
+  end
+  return out
+end
+
+local function formatCount(n)
+  local s = tostring(n or 0)
+  local out = ""
+  while #s > 3 do
+    out = "." .. s:sub(-3) .. out
+    s = s:sub(1, -4)
+  end
+  return s .. out
+end
+
+local function clip(text, maxLen)
+  text = tostring(text or "")
+  if maxLen <= 0 then return "" end
+  if #text <= maxLen then return text end
+  if maxLen == 1 then return text:sub(1, 1) end
+  return text:sub(1, maxLen - 1) .. ">"
+end
+
+local function outputStart()
+  return math.floor(state.io.size() / 2) + 1
+end
+
+local function inputEnd()
+  return outputStart() - 1
+end
+
+local function entryKey(item)
+  return tostring(item.name) .. "#" .. tostring(item.nbt or "")
+end
+
+local function namespaceOf(itemName)
+  return tostring(itemName):match("^(.-):") or "unknown"
+end
+
+local function chooseIOName()
+  if IO_NAME and isInventory(IO_NAME) then
+    return IO_NAME
+  end
+
+  for _, name in ipairs(sortedNames()) do
+    if isInventory(name) and tostring(name):match("^minecraft:chest") then
+      return name
+    end
+  end
+
+  for _, side in ipairs(SIDE_ORDER) do
+    if isInventory(side) then
+      return side
+    end
+  end
+
+  for _, name in ipairs(sortedNames()) do
+    if isInventory(name) then
+      return name
+    end
+  end
+
+  return nil
+end
+
+local function getMonitor()
+  if MONITOR_NAME and MONITOR_NAME ~= "" then
+    if peripheral.isPresent(MONITOR_NAME) and peripheral.hasType(MONITOR_NAME, "monitor") then
+      return peripheral.wrap(MONITOR_NAME)
+    end
+    return nil
+  end
+  return peripheral.find("monitor")
+end
+
+local function loadMap()
+  state.modMap = {}
+  if not fs.exists(MAP_FILE) then return end
+  local h = fs.open(MAP_FILE, "r")
+  if not h then return end
+  local raw = h.readAll()
+  h.close()
+  local data = textutils.unserialize(raw)
+  if type(data) == "table" then
+    state.modMap = data
+  end
+end
+
+local function saveMap()
+  local h = fs.open(MAP_FILE, "w")
+  if not h then return end
+  h.write(textutils.serialize(state.modMap))
+  h.close()
+end
+
+local function classifyItemName(itemName)
+  local base = tostring(itemName):match(":(.+)$") or tostring(itemName)
+
+  if base == "ancient_debris"
+    or base:find("_ore", 1, true)
+    or base:find("ore_", 1, true)
+    or base:find("raw_", 1, true)
+    or base:find("_raw", 1, true)
+  then
+    return "ores"
+  end
+
+  local stoneWords = {
+    "stone", "cobblestone", "deepslate", "cobbled_deepslate", "blackstone", "basalt",
+    "andesite", "diorite", "granite", "tuff", "calcite", "dripstone", "netherrack",
+    "end_stone", "sandstone", "red_sandstone", "gravel", "flint", "slate", "limestone",
+    "marble", "scoria",
+  }
+
+  for _, word in ipairs(stoneWords) do
+    if base:find(word, 1, true) then
+      return "stone"
+    end
+  end
+
+  local woodWords = {
+    "_log", "_wood", "stripped_", "planks", "_stem", "_hyphae", "leaves",
+    "sapling", "bamboo", "mangrove_roots", "_boat", "chest_boat",
+  }
+
+  for _, word in ipairs(woodWords) do
+    if base:find(word, 1, true) then
+      return "wood"
+    end
+  end
+
+  return nil
+end
+
+local function discoverPoolNames()
+  local out = {}
+  local reserved = {}
+  reserved[state.ioName] = true
+  for _, name in pairs(SPECIAL_TARGETS) do
+    if name then reserved[name] = true end
+  end
+
+  if AUTO_MOD_POOL then
+    for _, name in ipairs(sortedNames()) do
+      if isInventory(name) and not reserved[name] then
+        out[#out + 1] = name
+      end
+    end
+  else
+    for _, name in ipairs(MOD_POOL_NAMES) do
+      if isInventory(name) and not reserved[name] then
+        out[#out + 1] = name
+      end
+    end
+  end
+
+  table.sort(out)
+  return uniqueList(out)
+end
+
+local function refreshTopology()
+  state.ioName = chooseIOName()
+  if not state.ioName then
+    error("Keine I/O-Kiste gefunden. Setz IO_NAME auf deine normale Minecraft-Kiste.", 0)
+  end
+  if not isInventory(state.ioName) then
+    error("IO_NAME ist kein Inventar: " .. tostring(state.ioName), 0)
+  end
+
+  state.io = peripheral.wrap(state.ioName)
+  state.monitor = getMonitor()
+  if state.monitor then
+    state.monitor.setTextScale(MONITOR_SCALE)
+    state.monitor.setBackgroundColor(colors.black)
+    state.monitor.setTextColor(colors.white)
+  end
+
+  state.poolNames = discoverPoolNames()
+
+  local allStorage = {}
+  for _, name in pairs(SPECIAL_TARGETS) do
+    if name and isInventory(name) and name ~= state.ioName then
+      allStorage[#allStorage + 1] = name
+    end
+  end
+  for _, name in ipairs(state.poolNames) do
+    allStorage[#allStorage + 1] = name
+  end
+  state.storageNames = uniqueList(allStorage)
+
+  if #state.storageNames == 0 then
+    error("Keine Lager-Inventare gefunden. Trag SPECIAL_TARGETS oder MOD_POOL_NAMES ein.", 0)
+  end
+
+  local validPool = {}
+  for _, name in ipairs(state.poolNames) do
+    validPool[name] = true
+  end
+
+  local cleanMap = {}
+  local used = {}
+  for modName, invName in pairs(state.modMap) do
+    if validPool[invName] and not used[invName] then
+      cleanMap[modName] = invName
+      used[invName] = true
+    end
+  end
+  state.modMap = cleanMap
+
+  state.freePool = {}
+  for _, name in ipairs(state.poolNames) do
+    if not used[name] then
+      state.freePool[#state.freePool + 1] = name
+    end
+  end
+
+  saveMap()
+  state.dirty = true
+end
+
+local function ensureModTarget(modName)
+  local current = state.modMap[modName]
+  if current and isInventory(current) then
+    return current
+  end
+
+  local nextFree = table.remove(state.freePool, 1)
+  if nextFree then
+    state.modMap[modName] = nextFree
+    saveMap()
+    return nextFree
+  end
+
+  if SPECIAL_TARGETS.overflow and isInventory(SPECIAL_TARGETS.overflow) then
+    return SPECIAL_TARGETS.overflow
+  end
+
+  return nil
+end
+
+local function chooseTargetForItem(item)
+  local special = classifyItemName(item.name)
+  if special and SPECIAL_TARGETS[special] and isInventory(SPECIAL_TARGETS[special]) then
+    return SPECIAL_TARGETS[special], special
+  end
+
+  local modName = namespaceOf(item.name)
+  return ensureModTarget(modName), modName
+end
+
+local function scanStorage()
+  local index = {}
+  local order = {}
+  local totalItems = 0
+  local totalStacks = 0
+
+  for _, invName in ipairs(state.storageNames) do
+    local inv = peripheral.wrap(invName)
+    if inv then
+      for slot, item in pairs(inv.list()) do
+        totalStacks = totalStacks + 1
+        totalItems = totalItems + item.count
+
+        local key = entryKey(item)
+        local entry = index[key]
+        if not entry then
+          local detail = inv.getItemDetail(slot)
+          entry = {
+            key = key,
+            name = item.name,
+            nbt = item.nbt,
+            displayName = (detail and detail.displayName) or item.name,
+            count = 0,
+            locs = {},
+          }
+          index[key] = entry
+          order[#order + 1] = entry
+        end
+
+        entry.count = entry.count + item.count
+        entry.locs[#entry.locs + 1] = { inv = invName, slot = slot, count = item.count }
+      end
+    end
+  end
+
+  table.sort(order, function(a, b)
+    local ad = a.displayName:lower()
+    local bd = b.displayName:lower()
+    if ad == bd then
+      return a.name < b.name
+    end
+    return ad < bd
+  end)
+
+  state.index = index
+  state.order = order
+  state.totalItems = totalItems
+  state.totalStacks = totalStacks
+  state.lastScan = os.epoch("utc")
+  state.dirty = false
+end
+
+local function ensureFresh(force)
+  if force or state.dirty or (os.epoch("utc") - state.lastScan) >= (SCAN_INTERVAL * 1000) then
+    scanStorage()
+  end
+end
+
+local function sortInput()
+  local movedAny = false
+
+  for slot = 1, inputEnd() do
+    while true do
+      local item = state.io.getItemDetail(slot)
+      if not item then break end
+
+      local target = chooseTargetForItem(item)
+      local moved = 0
+
+      if target then
+        local ok, sent = pcall(state.io.pushItems, target, slot)
+        if ok and sent and sent > 0 then
+          moved = sent
+        end
+      end
+
+      if moved == 0 and SPECIAL_TARGETS.overflow and isInventory(SPECIAL_TARGETS.overflow) and target ~= SPECIAL_TARGETS.overflow then
+        local ok, sent = pcall(state.io.pushItems, SPECIAL_TARGETS.overflow, slot)
+        if ok and sent and sent > 0 then
+          moved = sent
+        end
+      end
+
+      if moved == 0 then
+        break
+      end
+
+      movedAny = true
+    end
+  end
+
+  if movedAny then
+    state.dirty = true
+  end
+end
+
+local function moveIntoOutput(fromInvName, fromSlot, amount)
+  local inv = peripheral.wrap(fromInvName)
+  if not inv then return 0 end
+
+  local moved = 0
+  for toSlot = outputStart(), state.io.size() do
+    local remaining = amount - moved
+    if remaining <= 0 then break end
+    local ok, sent = pcall(inv.pushItems, state.ioName, fromSlot, remaining, toSlot)
+    if ok and sent and sent > 0 then
+      moved = moved + sent
+    end
+  end
+
+  return moved
+end
+
+local function findMatches(query)
+  ensureFresh(false)
+  local q = tostring(query or ""):lower()
+  local exact = {}
+  local fuzzy = {}
+
+  for _, entry in ipairs(state.order) do
+    local name = entry.name:lower()
+    local display = entry.displayName:lower()
+    if name == q or display == q then
+      exact[#exact + 1] = entry
+    end
+  end
+
+  if #exact > 0 then
+    return exact
+  end
+
+  for _, entry in ipairs(state.order) do
+    local name = entry.name:lower()
+    local display = entry.displayName:lower()
+    if name:find(q, 1, true) or display:find(q, 1, true) then
+      fuzzy[#fuzzy + 1] = entry
+    end
+  end
+
+  return fuzzy
+end
+
+local function printEntries(entries, maxLines)
+  maxLines = maxLines or #entries
+  for i = 1, math.min(#entries, maxLines) do
+    local e = entries[i]
+    print(("%2d) %s  [%s]  x%s"):format(i, e.displayName, e.name, formatCount(e.count)))
+  end
+  if #entries > maxLines then
+    print(("... %d weitere Treffer"):format(#entries - maxLines))
+  end
+end
+
+local function withdraw(query, amount)
+  ensureFresh(true)
+  local matches = findMatches(query)
+
+  if #matches == 0 then
+    print("Nichts gefunden: " .. tostring(query))
+    return
+  end
+
+  if #matches > 1 then
+    print("Mehrdeutig. Nimm einen genaueren Namen:")
+    printEntries(matches, 15)
+    return
+  end
+
+  local entry = matches[1]
+  local remaining = amount
+  for _, loc in ipairs(entry.locs) do
+    if remaining <= 0 then break end
+    local moved = moveIntoOutput(loc.inv, loc.slot, remaining)
+    remaining = remaining - moved
+  end
+
+  local movedTotal = amount - remaining
+  if movedTotal > 0 then
+    state.dirty = true
+    ensureFresh(true)
+  end
+
+  print(("Ausgegeben: %d x %s"):format(movedTotal, entry.displayName))
+  if remaining > 0 then
+    print(("Nicht mehr vorhanden oder Output-Haelfte voll: %d"):format(remaining))
+  end
+end
+
+local function listItems(filter)
+  ensureFresh(false)
+
+  if not filter or filter == "" then
+    print(("Typen: %d | Items: %s"):format(#state.order, formatCount(state.totalItems)))
+    printEntries(state.order, 20)
+    return
+  end
+
+  local hits = findMatches(filter)
+  if #hits == 0 then
+    print("Keine Treffer fuer: " .. tostring(filter))
+    return
+  end
+
+  print(("Treffer fuer '%s': %d"):format(filter, #hits))
+  printEntries(hits, 20)
+end
+
+local function listAssignments()
+  print("I/O: " .. tostring(state.ioName))
+  print("Input-Slots: 1-" .. inputEnd())
+  print("Output-Slots: " .. outputStart() .. "-" .. state.io.size())
+  print("")
+  print("Spezialkisten:")
+  print("  ores     -> " .. tostring(SPECIAL_TARGETS.ores or "-"))
+  print("  stone    -> " .. tostring(SPECIAL_TARGETS.stone or "-"))
+  print("  wood     -> " .. tostring(SPECIAL_TARGETS.wood or "-"))
+  print("  overflow -> " .. tostring(SPECIAL_TARGETS.overflow or "-"))
+  print("")
+  print("Mod-Zuordnung:")
+
+  local pairsList = {}
+  for modName, invName in pairs(state.modMap) do
+    pairsList[#pairsList + 1] = { mod = modName, inv = invName }
+  end
+  table.sort(pairsList, function(a, b) return a.mod < b.mod end)
+
+  if #pairsList == 0 then
+    print("  noch keine")
+  else
+    for _, row in ipairs(pairsList) do
+      print("  " .. row.mod .. " -> " .. row.inv)
+    end
+  end
+
+  print("")
+  print("Freie Mod-Kisten: " .. #state.freePool)
+end
+
+local function printStatus()
+  print("I/O-Kiste: " .. tostring(state.ioName))
+  print("Lager-Inventare: " .. tostring(#state.storageNames))
+  print("Mod-Pool: " .. tostring(#state.poolNames))
+  print("Monitor: " .. (state.monitor and "ja" or "nein"))
+  print("Typen: " .. tostring(#state.order) .. " | Items: " .. formatCount(state.totalItems))
+end
+
+local function redrawMonitor(page)
+  local m = state.monitor
+  if not m then return 1, 1 end
+
+  local w, h = m.getSize()
+  local lines = math.max(1, h - 2)
+  local pages = math.max(1, math.ceil(#state.order / lines))
+  if page > pages then page = 1 end
+
+  m.setBackgroundColor(colors.black)
+  m.clear()
+
+  m.setTextColor(colors.yellow)
+  m.setCursorPos(1, 1)
+  m.write(clip(("Lager %d/%d  %d Typen  %s Items"):format(page, pages, #state.order, formatCount(state.totalItems)), w))
+
+  local startIndex = (page - 1) * lines + 1
+  for row = 1, lines do
+    local entry = state.order[startIndex + row - 1]
+    local y = row + 1
+    if y > h then break end
+    if entry then
+      local countText = formatCount(entry.count)
+      local leftWidth = math.max(1, w - #countText - 1)
+      m.setTextColor(colors.white)
+      m.setCursorPos(1, y)
+      m.write(clip(entry.displayName, leftWidth))
+      m.setTextColor(colors.lime)
+      m.setCursorPos(w - #countText + 1, y)
+      m.write(countText)
+    end
+  end
+
+  return page, pages
+end
+
+local function monitorLoop()
+  local page = 1
+  while true do
+    state.monitor = getMonitor()
+    if state.monitor then
+      state.monitor.setTextScale(MONITOR_SCALE)
+      state.monitor.setBackgroundColor(colors.black)
+      state.monitor.setTextColor(colors.white)
+    end
+    ensureFresh(false)
+    if state.monitor then
+      local currentPage, pageCount = redrawMonitor(page)
+      page = currentPage + 1
+      if page > pageCount then page = 1 end
+    end
+    sleep(PAGE_INTERVAL)
+  end
+end
+
+local function sorterLoop()
+  while true do
+    sortInput()
+    sleep(SORT_INTERVAL)
+  end
+end
+
+local function parseQueryAndAmount(args, startIndex)
+  if #args < startIndex then return "", 1 end
+  local last = #args
+  local amount = tonumber(args[#args])
+  if amount then
+    last = #args - 1
+  else
+    amount = 1
+  end
+  if amount < 1 then amount = 1 end
+  return table.concat(args, " ", startIndex, last), amount
+end
+
+local function printHelp()
+  print("Befehle:")
+  print("  hilfe")
+  print("  status")
+  print("  zuordnung")
+  print("  scan")
+  print("  neu")
+  print("  list [filter]")
+  print("  hole <item oder teilname> [anzahl]")
+  print("  stop")
+end
+
+local function commandLoop()
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("Lagersystem gestartet.")
+  printStatus()
+  print("")
+  printHelp()
+  print("")
+
+  while true do
+    write("lager> ")
+    local line = read()
+    local args = {}
+    for part in line:gmatch("%S+") do
+      args[#args + 1] = part
+    end
+
+    local cmd = (args[1] or ""):lower()
+
+    if cmd == "" then
+    elseif cmd == "hilfe" then
+      printHelp()
+    elseif cmd == "status" then
+      ensureFresh(false)
+      printStatus()
+    elseif cmd == "zuordnung" then
+      listAssignments()
+    elseif cmd == "scan" then
+      ensureFresh(true)
+      print("Scan fertig.")
+    elseif cmd == "neu" then
+      refreshTopology()
+      ensureFresh(true)
+      print("Peripherie neu geladen.")
+      printStatus()
+    elseif cmd == "list" then
+      listItems(table.concat(args, " ", 2))
+    elseif cmd == "hole" then
+      local query, amount = parseQueryAndAmount(args, 2)
+      if query == "" then
+        print("Benutzung: hole <item oder teilname> [anzahl]")
+      else
+        withdraw(query, amount)
+      end
+    elseif cmd == "stop" or cmd == "exit" then
+      print("Programm beendet.")
+      return
+    else
+      print("Unbekannter Befehl. 'hilfe' zeigt die Befehle.")
+    end
+  end
+end
+
+loadMap()
+refreshTopology()
+ensureFresh(true)
+
+parallel.waitForAny(
+  commandLoop,
+  function()
+    parallel.waitForAll(sorterLoop, monitorLoop)
+  end
+)
