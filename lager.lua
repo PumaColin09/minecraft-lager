@@ -5,6 +5,7 @@ local SORT_INTERVAL = 1
 local SCAN_INTERVAL = 5
 local PAGE_INTERVAL = 4
 local TOPOLOGY_REFRESH_INTERVAL = 10
+local OUTPUT_HOLD_SECONDS = 120
 local LIST_PREVIEW_COUNT = 10
 local LIST_MOD_COUNT = 8
 local MAP_FILE = "mod_map.txt"
@@ -42,9 +43,14 @@ local state = {
   lastShownKeys = {},
   lastShownQuery = "",
   dirty = true,
+  outputReservations = {},
 }
 
 local SIDE_ORDER = { "top", "bottom", "left", "right", "front", "back" }
+
+local function nowMs()
+  return os.epoch("utc")
+end
 
 local function sortedNames()
   local names = peripheral.getNames()
@@ -54,6 +60,28 @@ end
 
 local function isInventory(name)
   return name and peripheral.isPresent(name) and peripheral.hasType(name, "inventory")
+end
+
+local function inventorySignature()
+  local out = {}
+
+  for _, name in ipairs(sortedNames()) do
+    if isInventory(name) then
+      local inv = peripheral.wrap(name)
+      local size = 0
+
+      if inv and inv.size then
+        local ok, value = pcall(inv.size)
+        if ok and value then
+          size = value
+        end
+      end
+
+      out[#out + 1] = tostring(name) .. "=" .. tostring(size)
+    end
+  end
+
+  return table.concat(out, "|")
 end
 
 local function uniqueList(list)
@@ -265,10 +293,10 @@ local function classifyItemName(itemName)
   local woodParts = {
     "_log",
     "_wood",
-    "stripped_",
-    "planks",
+    "_planks",
     "_stem",
     "_hyphae",
+    "stripped_",
     "leaves",
     "sapling",
     "bamboo",
@@ -319,6 +347,24 @@ local function prettyModName(ns)
   end))
 end
 
+local function formatDisplayEntry(value)
+  if type(value) == "table" then
+    local name = value.displayName or value.name or value.id or value.effect or value.key or tostring(value)
+
+    if value.level then
+      return tostring(name) .. " " .. tostring(value.level)
+    end
+
+    if value.amplifier then
+      return tostring(name) .. " " .. tostring(value.amplifier)
+    end
+
+    return tostring(name)
+  end
+
+  return tostring(value)
+end
+
 local function joinDisplayList(entries, maxItems)
   if type(entries) ~= "table" or #entries == 0 then
     return ""
@@ -333,8 +379,7 @@ local function joinDisplayList(entries, maxItems)
       break
     end
 
-    local name = value.displayName or value.name or tostring(value)
-    parts[#parts + 1] = tostring(name)
+    parts[#parts + 1] = formatDisplayEntry(value)
   end
 
   return table.concat(parts, ", ")
@@ -402,20 +447,49 @@ local function discoverPoolNames()
   return uniqueList(out)
 end
 
-local function listSignature(list)
-  return table.concat(list or {}, "\31")
+local function cleanupOutputReservations()
+  if not state.io then
+    state.outputReservations = {}
+    return
+  end
+
+  local now = nowMs()
+
+  for slot, expiresAt in pairs(state.outputReservations) do
+    if expiresAt <= now or not state.io.getItemDetail(slot) then
+      state.outputReservations[slot] = nil
+    end
+  end
 end
 
-local function buildTopologySignature(ioName, poolNames, storageNames)
-  return table.concat({
-    tostring(ioName or ""),
-    listSignature(poolNames or {}),
-    listSignature(storageNames or {}),
-  }, "\30")
+local function reserveOutputSlot(slot)
+  state.outputReservations[slot] = nowMs() + (OUTPUT_HOLD_SECONDS * 1000)
+end
+
+local function isReservedOutputSlot(slot)
+  local expiresAt = state.outputReservations[slot]
+  if not expiresAt then
+    return false
+  end
+
+  if not state.io then
+    state.outputReservations[slot] = nil
+    return false
+  end
+
+  if expiresAt <= nowMs() or not state.io.getItemDetail(slot) then
+    state.outputReservations[slot] = nil
+    return false
+  end
+
+  return true
 end
 
 local function refreshTopology()
-  state.ioName = chooseIOName()
+  local oldIOName = state.ioName
+  local chosenIO = chooseIOName()
+
+  state.ioName = chosenIO
   if not state.ioName then
     error("Keine I/O-Kiste gefunden.\nSetz IO_NAME auf deine normale Minecraft-Kiste.", 0)
   end
@@ -475,13 +549,32 @@ local function refreshTopology()
     end
   end
 
-  saveMap()
-
-  local newSig = buildTopologySignature(state.ioName, state.poolNames, state.storageNames)
-  if state.topologySig == "" or state.topologySig ~= newSig then
-    state.dirty = true
+  if oldIOName ~= state.ioName then
+    state.outputReservations = {}
   end
-  state.topologySig = newSig
+
+  saveMap()
+  state.topologySig = inventorySignature()
+  state.lastTopologyCheck = nowMs()
+  state.dirty = true
+end
+
+local function ensureTopology(force)
+  local now = nowMs()
+
+  if not force and state.lastTopologyCheck > 0 and (now - state.lastTopologyCheck) < (TOPOLOGY_REFRESH_INTERVAL * 1000) then
+    return false
+  end
+
+  state.lastTopologyCheck = now
+
+  local sig = inventorySignature()
+  if force or sig ~= state.topologySig then
+    refreshTopology()
+    return true
+  end
+
+  return false
 end
 
 local function ensureModTarget(modName)
@@ -531,13 +624,10 @@ local function scanStorage()
         local entry = index[key]
         if not entry then
           local detail = inv.getItemDetail(slot)
-          local modName = namespaceOf(item.name)
           entry = {
             key = key,
             name = item.name,
             nbt = item.nbt,
-            modName = modName,
-            modLabel = prettyModName(modName),
             displayName = (detail and detail.displayName) or item.name,
             desc = buildDescription(detail),
             count = 0,
@@ -579,68 +669,128 @@ local function scanStorage()
   state.order = order
   state.totalItems = totalItems
   state.totalStacks = totalStacks
-  state.lastScan = os.epoch("utc")
+  state.lastScan = nowMs()
   state.dirty = false
 end
 
-local function ensureTopologyFresh(force)
-  local now = os.epoch("utc")
-
-  if not force and (now - state.lastTopologyCheck) < (TOPOLOGY_REFRESH_INTERVAL * 1000) then
-    return false
-  end
-
-  state.lastTopologyCheck = now
-  local previousSig = state.topologySig
-  local ok = pcall(refreshTopology)
-
-  if not ok then
-    return false
-  end
-
-  return state.topologySig ~= previousSig
-end
-
 local function ensureFresh(force)
-  local topologyChanged = ensureTopologyFresh(force)
+  local topologyChanged = ensureTopology(force)
 
-  if force or topologyChanged or state.dirty or (os.epoch("utc") - state.lastScan) >= (SCAN_INTERVAL * 1000) then
+  if force or topologyChanged or state.dirty or (nowMs() - state.lastScan) >= (SCAN_INTERVAL * 1000) then
     scanStorage()
   end
 end
 
+local function pushFromIO(targetName, fromSlot, toSlot)
+  if not targetName or targetName == state.ioName or not isInventory(targetName) then
+    return 0
+  end
+
+  local current = state.io.getItemDetail(fromSlot)
+  if not current then
+    return 0
+  end
+
+  local ok, sent
+  if toSlot then
+    ok, sent = pcall(state.io.pushItems, targetName, fromSlot, current.count, toSlot)
+  else
+    ok, sent = pcall(state.io.pushItems, targetName, fromSlot, current.count)
+  end
+
+  if ok and sent and sent > 0 then
+    return sent
+  end
+
+  return 0
+end
+
+local function moveIntoKnownStacks(fromSlot, item)
+  local entry = state.index[entryKey(item)]
+  if not entry then
+    return 0
+  end
+
+  local moved = 0
+
+  for _, loc in ipairs(entry.locs) do
+    if not state.io.getItemDetail(fromSlot) then
+      break
+    end
+
+    if loc.inv ~= state.ioName and isInventory(loc.inv) then
+      moved = moved + pushFromIO(loc.inv, fromSlot, loc.slot)
+    end
+  end
+
+  return moved
+end
+
+local function moveIntoAnyStorage(fromSlot, attemptedInventories)
+  local moved = 0
+
+  for _, invName in ipairs(state.poolNames) do
+    if invName ~= state.ioName and isInventory(invName) and not attemptedInventories[invName] then
+      attemptedInventories[invName] = true
+      moved = moved + pushFromIO(invName, fromSlot)
+
+      if not state.io.getItemDetail(fromSlot) then
+        break
+      end
+    end
+  end
+
+  return moved
+end
+
 local function sortInput()
+  ensureFresh(false)
+  cleanupOutputReservations()
+
   local movedAny = false
 
-  for slot = 1, inputEnd() do
-    while true do
-      local item = state.io.getItemDetail(slot)
-      if not item then
-        break
-      end
-
-      local target = chooseTargetForItem(item)
-      local moved = 0
-
-      if target then
-        local ok, sent = pcall(state.io.pushItems, target, slot)
-        if ok and sent and sent > 0 then
-          moved = sent
+  for slot = 1, state.io.size() do
+    if not isReservedOutputSlot(slot) then
+      while true do
+        local item = state.io.getItemDetail(slot)
+        if not item then
+          break
         end
-      end
 
-      if moved == 0 and SPECIAL_TARGETS.overflow and isInventory(SPECIAL_TARGETS.overflow) and target ~= SPECIAL_TARGETS.overflow then
-        local ok, sent = pcall(state.io.pushItems, SPECIAL_TARGETS.overflow, slot)
-        if ok and sent and sent > 0 then
-          moved = sent
+        local moved = 0
+
+        moved = moved + moveIntoKnownStacks(slot, item)
+
+        local attemptedInventories = {}
+
+        if state.io.getItemDetail(slot) then
+          local target = chooseTargetForItem(item)
+          if target and not attemptedInventories[target] then
+            attemptedInventories[target] = true
+            moved = moved + pushFromIO(target, slot)
+          end
         end
-      end
 
-      if moved == 0 then
-        break
-      end
+        if state.io.getItemDetail(slot)
+          and SPECIAL_TARGETS.overflow
+          and isInventory(SPECIAL_TARGETS.overflow)
+          and not attemptedInventories[SPECIAL_TARGETS.overflow]
+        then
+          attemptedInventories[SPECIAL_TARGETS.overflow] = true
+          moved = moved + pushFromIO(SPECIAL_TARGETS.overflow, slot)
+        end
 
-      movedAny = true
+        if state.io.getItemDetail(slot) then
+          moved = moved + moveIntoAnyStorage(slot, attemptedInventories)
+        end
+
+        if moved == 0 then
+          break
+        end
+
+        movedAny = true
+        state.dirty = true
+      end
     end
   end
 
@@ -655,6 +805,8 @@ local function moveIntoOutput(fromInvName, fromSlot, amount)
     return 0
   end
 
+  cleanupOutputReservations()
+
   local moved = 0
   for toSlot = outputStart(), state.io.size() do
     local remaining = amount - moved
@@ -662,316 +814,62 @@ local function moveIntoOutput(fromInvName, fromSlot, amount)
       break
     end
 
-    local ok, sent = pcall(inv.pushItems, state.ioName, fromSlot, remaining, toSlot)
-    if ok and sent and sent > 0 then
-      moved = moved + sent
+    if not isReservedOutputSlot(toSlot) then
+      local ok, sent = pcall(inv.pushItems, state.ioName, fromSlot, remaining, toSlot)
+      if ok and sent and sent > 0 then
+        moved = moved + sent
+        reserveOutputSlot(toSlot)
+      end
     end
   end
 
   return moved
 end
 
-local function splitWords(text)
-  local out = {}
-
-  for part in tostring(text or ""):gmatch("%S+") do
-    out[#out + 1] = part
-  end
-
-  return out
-end
-
-local function matchEntryScore(entry, query)
-  local q = trim(query):lower()
-  if q == "" then
-    return nil
-  end
-
-  local display = entry.displayName:lower()
-  local name = entry.name:lower()
-  local desc = tostring(entry.desc or ""):lower()
-  local modName = namespaceOf(entry.name):lower()
-  local modLabel = prettyModName(modName):lower()
-
-  if q:sub(1, 1) == "@" then
-    local modQuery = trim(q:sub(2))
-    if modQuery == "" then
-      return nil
-    end
-
-    if modName == modQuery or modLabel == modQuery then
-      return 1000
-    end
-
-    local score = 0
-    if modName:find(modQuery, 1, true) == 1 or modLabel:find(modQuery, 1, true) == 1 then
-      score = score + 700
-    end
-    if modName:find(modQuery, 1, true) or modLabel:find(modQuery, 1, true) then
-      score = score + 300
-    end
-
-    return score > 0 and score or nil
-  end
-
-  if name == q or display == q or (desc ~= "" and desc == q) then
-    return 1000
-  end
-
-  local score = 0
-  if display:find(q, 1, true) == 1 then
-    score = score + 700
-  end
-  if desc ~= "" and desc:find(q, 1, true) == 1 then
-    score = score + 650
-  end
-  if name:find(q, 1, true) == 1 then
-    score = score + 600
-  end
-  if display:find(q, 1, true) then
-    score = score + 300
-  end
-  if desc ~= "" and desc:find(q, 1, true) then
-    score = score + 260
-  end
-  if name:find(q, 1, true) then
-    score = score + 220
-  end
-
-  local words = splitWords(q)
-  local wordHits = 0
-
-  for _, word in ipairs(words) do
-    local hit = false
-
-    if display:find(word, 1, true) then
-      score = score + 90
-      hit = true
-    end
-    if desc ~= "" and desc:find(word, 1, true) then
-      score = score + 70
-      hit = true
-    end
-    if name:find(word, 1, true) then
-      score = score + 50
-      hit = true
-    end
-
-    if hit then
-      wordHits = wordHits + 1
-    end
-  end
-
-  if #words > 1 and wordHits < #words then
-    return nil
-  end
-
-  if score > 0 then
-    score = score + math.min(100, wordHits * 15)
-    return score
-  end
-
-  return nil
-end
-
 local function findMatches(query)
   ensureFresh(false)
 
-  local scored = {}
-  local q = trim(query)
-  if q == "" then
-    return {}
+  local q = tostring(query or ""):lower()
+  local exact = {}
+  local fuzzy = {}
+
+  for _, entry in ipairs(state.order) do
+    local name = entry.name:lower()
+    local display = entry.displayName:lower()
+    local desc = tostring(entry.desc or ""):lower()
+
+    if name == q or display == q or (q ~= "" and desc == q) then
+      exact[#exact + 1] = entry
+    end
+  end
+
+  if #exact > 0 then
+    return exact
   end
 
   for _, entry in ipairs(state.order) do
-    local score = matchEntryScore(entry, q)
-    if score then
-      scored[#scored + 1] = {
-        entry = entry,
-        score = score,
-      }
+    local name = entry.name:lower()
+    local display = entry.displayName:lower()
+    local desc = tostring(entry.desc or ""):lower()
+
+    if name:find(q, 1, true) or display:find(q, 1, true) or (q ~= "" and desc:find(q, 1, true)) then
+      fuzzy[#fuzzy + 1] = entry
     end
   end
 
-  table.sort(scored, function(a, b)
-    if a.score == b.score then
-      local al = entryLabel(a.entry):lower()
-      local bl = entryLabel(b.entry):lower()
-      if al == bl then
-        return a.entry.name < b.entry.name
-      end
-      return al < bl
-    end
-    return a.score > b.score
-  end)
-
-  local out = {}
-  for i, row in ipairs(scored) do
-    out[i] = row.entry
-  end
-
-  return out
+  return fuzzy
 end
 
-local function clearShownEntries()
-  state.lastShownKeys = {}
-  state.lastShownQuery = ""
-end
-
-local function rememberShownEntries(entries, query)
-  clearShownEntries()
-  state.lastShownQuery = trim(query)
-
-  for i, entry in ipairs(entries) do
-    state.lastShownKeys[i] = entry.key
-  end
-end
-
-local function printEntryLine(index, entry)
-  local width = select(1, term.getSize()) or 51
-  local prefix = ("%2d) "):format(index)
-  local countText = " x" .. formatCount(entry.count)
-  local free = math.max(10, width - #prefix - #countText)
-  local text = clip(entryLabel(entry), free)
-  local padding = math.max(1, width - #prefix - #text - #countText)
-
-  print(prefix .. text .. string.rep(" ", padding) .. countText)
-end
-
-local function printPreviewEntries(entries, maxLines)
-  local width = select(1, term.getSize()) or 51
+local function printEntries(entries, maxLines)
+  maxLines = maxLines or #entries
 
   for i = 1, math.min(#entries, maxLines) do
-    local entry = entries[i]
-    local prefix = " - "
-    local countText = " x" .. formatCount(entry.count)
-    local free = math.max(10, width - #prefix - #countText)
-    local text = clip(entryLabel(entry), free)
-    local padding = math.max(1, width - #prefix - #text - #countText)
-
-    print(prefix .. text .. string.rep(" ", padding) .. countText)
-  end
-end
-
-local function collectModSummary(entries)
-  local mods = {}
-
-  for _, entry in ipairs(entries) do
-    local ns = namespaceOf(entry.name)
-    local row = mods[ns]
-    if not row then
-      row = {
-        key = ns,
-        label = prettyModName(ns),
-        types = 0,
-        items = 0,
-      }
-      mods[ns] = row
-    end
-
-    row.types = row.types + 1
-    row.items = row.items + entry.count
+    local e = entries[i]
+    print(("%2d) %s x%s"):format(i, entryLabel(e), formatCount(e.count)))
   end
 
-  local out = {}
-  for _, row in pairs(mods) do
-    out[#out + 1] = row
-  end
-
-  table.sort(out, function(a, b)
-    if a.types == b.types then
-      return a.label < b.label
-    end
-    return a.types > b.types
-  end)
-
-  return out
-end
-
-local function printOverview()
-  local byCount = {}
-  for i, entry in ipairs(state.order) do
-    byCount[i] = entry
-  end
-
-  table.sort(byCount, function(a, b)
-    if a.count == b.count then
-      return entryLabel(a):lower() < entryLabel(b):lower()
-    end
-    return a.count > b.count
-  end)
-
-  local mods = collectModSummary(state.order)
-
-  print(("Typen: %d | Items: %s | Lagerkisten: %d"):format(#state.order, formatCount(state.totalItems), #state.storageNames))
-  print("Schnell finden mit:")
-  print(" list <name>      sucht nach Name oder Beschreibung")
-  print(" list @mod        zeigt nur Items aus einem Mod")
-  print(" hole <name>      gibt direkt aus")
-  print(" hole #<nr>       nimmt Nummer aus letzter Trefferliste")
-  print("")
-  print("Meiste Items:")
-  printPreviewEntries(byCount, LIST_PREVIEW_COUNT)
-
-  if #mods > 0 then
-    print("")
-    print("Mods im Lager:")
-    for i = 1, math.min(#mods, LIST_MOD_COUNT) do
-      local row = mods[i]
-      print((" %d) %s - %d Typen, %s Items"):format(i, row.label, row.types, formatCount(row.items)))
-    end
-
-    if #mods > LIST_MOD_COUNT then
-      print((" ... %d weitere Mods"):format(#mods - LIST_MOD_COUNT))
-    end
-  end
-end
-
-local function printEntries(entries, maxLines, startIndex)
-  maxLines = maxLines or #entries
-  startIndex = startIndex or 1
-
-  local endIndex = math.min(#entries, startIndex + maxLines - 1)
-  for i = startIndex, endIndex do
-    printEntryLine(i, entries[i])
-  end
-end
-
-local function showPagedEntries(entries, title)
-  local height = select(2, term.getSize()) or 19
-  local pageSize = math.max(5, height - 5)
-  local pageCount = math.max(1, math.ceil(#entries / pageSize))
-  local page = 1
-
-  while true do
-    local startIndex = (page - 1) * pageSize + 1
-    local endIndex = math.min(#entries, startIndex + pageSize - 1)
-
-    print(("%s | Seite %d/%d | %d-%d von %d"):format(title, page, pageCount, startIndex, endIndex, #entries))
-    printEntries(entries, pageSize, startIndex)
-
-    if pageCount == 1 then
-      return
-    end
-
-    write("[Enter=weiter, Zahl=Seite, q=Ende] ")
-    local answer = trim(read() or ""):lower()
-
-    if answer == "" then
-      page = page + 1
-      if page > pageCount then
-        return
-      end
-    elseif answer == "q" or answer == "x" or answer == "ende" then
-      return
-    else
-      local wanted = tonumber(answer)
-      if wanted and wanted >= 1 and wanted <= pageCount then
-        page = wanted
-      else
-        print("Bitte Enter, q oder eine Seitennummer eingeben.")
-      end
-    end
+  if #entries > maxLines then
+    print(("... %d weitere Treffer"):format(#entries - maxLines))
   end
 end
 
@@ -980,85 +878,46 @@ local function chooseMatch(matches)
     return matches[1]
   end
 
-  local height = select(2, term.getSize()) or 19
-  local pageSize = math.max(5, height - 6)
-  local pageCount = math.max(1, math.ceil(#matches / pageSize))
-  local page = 1
+  if #matches > 30 then
+    print("Zu viele Treffer. Bitte Suchbegriff verfeinern.")
+    printEntries(matches, 30)
+    return nil
+  end
 
-  print("Mehrdeutig. Waehle die passende Nummer.")
+  print("Mehrdeutig.")
+  print("Waehle die passende Nummer:")
+  printEntries(matches, #matches)
 
   while true do
-    local startIndex = (page - 1) * pageSize + 1
-    local endIndex = math.min(#matches, startIndex + pageSize - 1)
+    write(("Auswahl 1-%d (leer = abbrechen): "):format(#matches))
+    local line = read()
 
-    print(("Treffer %d-%d von %d | Seite %d/%d"):format(startIndex, endIndex, #matches, page, pageCount))
-    printEntries(matches, pageSize, startIndex)
-    write(("Auswahl 1-%d (n/p/q): "):format(#matches))
-
-    local line = trim(read() or ""):lower()
-    if line == "" or line == "q" or line == "x" or line == "abbrechen" then
+    if not line or line == "" then
       return nil
-    elseif line == "n" or line == "weiter" then
-      page = page + 1
-      if page > pageCount then
-        page = 1
-      end
-    elseif line == "p" or line == "zurueck" then
-      page = page - 1
-      if page < 1 then
-        page = pageCount
-      end
-    else
-      local idx = tonumber(line)
-      if idx and matches[idx] then
-        return matches[idx]
-      end
-
-      print("Bitte eine gueltige Nummer oder n/p/q eingeben.")
     end
-  end
-end
 
-local function resolveListReference(query)
-  local idx = tonumber(tostring(query or ""):match("^#(%d+)$"))
-  if not idx then
-    return nil, nil
-  end
+    local idx = tonumber(line)
+    if idx and matches[idx] then
+      return matches[idx]
+    end
 
-  local key = state.lastShownKeys[idx]
-  if not key then
-    return false, "Nummer nicht in letzter Trefferliste: #" .. tostring(idx)
+    print("Bitte eine gueltige Nummer eingeben.")
   end
-
-  local entry = state.index[key]
-  if not entry then
-    return false, "Der Eintrag #" .. tostring(idx) .. " ist nicht mehr im Lager vorhanden."
-  end
-
-  return entry, nil
 end
 
 local function withdraw(query, amount)
   ensureFresh(true)
 
-  local entry, refError = resolveListReference(query)
-  if entry == false then
-    print(refError)
+  local matches = findMatches(query)
+  if #matches == 0 then
+    print("Nichts gefunden: " .. tostring(query))
     return
   end
 
+  local entry = chooseMatch(matches)
   if not entry then
-    local matches = findMatches(query)
-    if #matches == 0 then
-      print("Nichts gefunden: " .. tostring(query))
-      return
-    end
-
-    entry = chooseMatch(matches)
-    if not entry then
-      print("Abgebrochen.")
-      return
-    end
+    print("Abgebrochen.")
+    return
   end
 
   local remaining = amount
@@ -1083,38 +942,35 @@ local function withdraw(query, amount)
   end
 
   if remaining > 0 then
-    print(("Nicht mehr vorhanden oder Output-Haelfte voll: %d"):format(remaining))
+    print(("Nicht mehr vorhanden oder Ausgabe-Bereich belegt: %d"):format(remaining))
   end
 end
 
 local function listItems(filter)
   ensureFresh(false)
 
-  local cleanFilter = trim(filter)
-  if cleanFilter == "" then
-    clearShownEntries()
-    printOverview()
+  if not filter or filter == "" then
+    print(("Typen: %d | Items: %s"):format(#state.order, formatCount(state.totalItems)))
+    printEntries(state.order, 20)
     return
   end
 
-  local hits = findMatches(cleanFilter)
+  local hits = findMatches(filter)
   if #hits == 0 then
-    clearShownEntries()
-    print("Keine Treffer fuer: " .. tostring(cleanFilter))
+    print("Keine Treffer fuer: " .. tostring(filter))
     return
   end
 
-  rememberShownEntries(hits, cleanFilter)
-  showPagedEntries(hits, ("Treffer fuer '%s': %d"):format(cleanFilter, #hits))
-  print("Tipp: Mit 'hole #<nr>' kannst du direkt eine Nummer aus der Liste holen.")
+  print(("Treffer fuer '%s': %d"):format(filter, #hits))
+  printEntries(hits, 20)
 end
 
 local function listAssignments()
-  ensureTopologyFresh(false)
+  ensureFresh(false)
 
   print("I/O: " .. tostring(state.ioName))
-  print("Input-Slots: 1-" .. inputEnd())
-  print("Output-Slots: " .. outputStart() .. "-" .. state.io.size())
+  print("Auto-Einsortieren: alle Slots")
+  print("Ausgabe-Schutz: Slots " .. outputStart() .. "-" .. state.io.size() .. " fuer " .. OUTPUT_HOLD_SECONDS .. "s nach 'hole'")
   print("")
   print("Spezialkisten:")
   print(" ores -> " .. tostring(SPECIAL_TARGETS.ores or "-"))
@@ -1146,11 +1002,14 @@ local function listAssignments()
 end
 
 local function printStatus()
+  ensureFresh(false)
+
   print("I/O-Kiste: " .. tostring(state.ioName))
   print("Lager-Inventare: " .. tostring(#state.storageNames))
   print("Mod-Pool: " .. tostring(#state.poolNames))
   print("Monitor: " .. (state.monitor and "ja" or "nein"))
-  print("Auto-Kistencheck: alle " .. tostring(TOPOLOGY_REFRESH_INTERVAL) .. "s")
+  print("Auto-Einsortieren: alle Slots")
+  print("Ausgabe-Schutz unten: " .. OUTPUT_HOLD_SECONDS .. "s")
   print("Typen: " .. tostring(#state.order) .. " | Items: " .. formatCount(state.totalItems))
 end
 
@@ -1235,22 +1094,15 @@ end
 
 local function sorterLoop()
   while true do
-    local topologyChanged = ensureTopologyFresh(false)
     sortInput()
-
-    if topologyChanged then
-      scanStorage()
-    end
-
     sleep(SORT_INTERVAL)
   end
 end
 
 local function fullScan()
-  refreshTopology()
-  state.lastTopologyCheck = os.epoch("utc")
+  ensureTopology(true)
   sortInput()
-  scanStorage()
+  ensureFresh(true)
 end
 
 local function parseQueryAndAmount(args, startIndex)
@@ -1280,12 +1132,13 @@ local function printHelp()
   print(" zuordnung")
   print(" scan")
   print(" neu")
-  print(" list")
-  print(" list <filter>")
-  print(" list @<mod>")
+  print(" list [filter]")
   print(" hole <name> [anzahl]")
-  print(" hole #<nr> [anzahl]")
   print(" stop")
+  print("")
+  print("Hinweis:")
+  print(" Alle Slots der I/O-Kiste werden automatisch einsortiert.")
+  print(" Der untere Bereich bleibt nach 'hole' " .. OUTPUT_HOLD_SECONDS .. "s als Ausgabe geschuetzt.")
 end
 
 local function commandLoop()
@@ -1302,7 +1155,7 @@ local function commandLoop()
     local line = read()
     local args = {}
 
-    for part in tostring(line or ""):gmatch("%S+") do
+    for part in line:gmatch("%S+") do
       args[#args + 1] = part
     end
 
@@ -1312,26 +1165,17 @@ local function commandLoop()
     elseif cmd == "hilfe" then
       printHelp()
     elseif cmd == "status" then
-      ensureFresh(false)
       printStatus()
     elseif cmd == "zuordnung" then
       listAssignments()
     elseif cmd == "scan" then
-      local ok, err = pcall(fullScan)
-      if ok then
-        print("Scan fertig. Neue Kisten und Items wurden uebernommen.")
-      else
-        print("Scan fehlgeschlagen: " .. tostring(err))
-      end
+      fullScan()
+      print("Scan fertig. Neue Kisten wurden uebernommen und das Lager neu sortiert.")
     elseif cmd == "neu" then
-      local ok, err = pcall(fullScan)
-      if ok then
-        print("Peripherie neu geladen.")
-        printStatus()
-      else
-        print("Neu laden fehlgeschlagen: " .. tostring(err))
-      end
-    elseif cmd == "list" or cmd == "such" or cmd == "suche" or cmd == "find" then
+      fullScan()
+      print("Peripherie neu geladen.")
+      printStatus()
+    elseif cmd == "list" then
       listItems(table.concat(args, " ", 2))
     elseif cmd == "hole" then
       local query, amount = parseQueryAndAmount(args, 2)
@@ -1351,7 +1195,6 @@ end
 
 loadMap()
 refreshTopology()
-state.lastTopologyCheck = os.epoch("utc")
 ensureFresh(true)
 
 parallel.waitForAny(
