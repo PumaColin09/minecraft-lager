@@ -382,7 +382,7 @@ local function resolveMeBridgeName()
   end
 
   for _, name in ipairs(sortedNames()) do
-    if hasType(name, "meBridge") then
+    if hasType(name, "me_bridge") then
       return name
     end
   end
