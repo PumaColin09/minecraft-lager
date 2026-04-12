@@ -1,4 +1,4 @@
-local CONFIG_FILE = "lager_stats_config.txt"
+local CONFIG_FILE = "lager_fs_auto_config.txt"
 local ROLE_MARKER_SLOT = 1
 local DEFAULT_MONITOR_SCALE = 0.5
 local DEFAULT_SCAN_INTERVAL = 8
@@ -31,7 +31,7 @@ local state = {
     ioName = nil,
     priorityName = nil,
     overflowName = nil,
-    supportEnabled = false,
+    supportEnabled = true,
     supportInterval = DEFAULT_SUPPORT_INTERVAL,
   },
 }
@@ -523,10 +523,19 @@ local function isPriorityControllerName(name)
     return false
   end
 
-  return typesContain(name, "storage_controller")
+  if typesContain(name, "storage_controller")
     or typesContain(name, "controller_access")
     or typesContain(name, "controlleraccess")
-    or typesContain(name, "drawer_controller")
+    or typesContain(name, "drawer_controller") then
+    return true
+  end
+
+  local lowerName = tostring(name or ""):lower()
+  if lowerName:find("functionalstorage", 1, true) and lowerName:find("controller", 1, true) then
+    return true
+  end
+
+  return false
 end
 
 local function resolveIoName()
