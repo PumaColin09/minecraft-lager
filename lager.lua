@@ -222,6 +222,10 @@ local function hasType(name, typeName)
   return false
 end
 
+local function isMEBridgeName(name)
+  return hasType(name, 'meBridge') or hasType(name, 'me_bridge')
+end
+
 local function safeWrap(name)
   if not name or not peripheral.isPresent(name) then
     return nil
@@ -377,12 +381,12 @@ local function resolveMeBridgeName()
     return nil
   end
 
-  if state.config.meBridgeName and state.config.meBridgeName ~= "" and peripheral.isPresent(state.config.meBridgeName) and hasType(state.config.meBridgeName, "meBridge") then
+  if state.config.meBridgeName and state.config.meBridgeName ~= "" and peripheral.isPresent(state.config.meBridgeName) and isMEBridgeName(state.config.meBridgeName) then
     return state.config.meBridgeName
   end
 
   for _, name in ipairs(sortedNames()) do
-    if hasType(name, "me_bridge") then
+    if isMEBridgeName(name) then
       return name
     end
   end
@@ -657,9 +661,33 @@ local function buildMeStats()
     }
   end
 
+  local function tryCalls(methods, ...)
+    for _, methodName in ipairs(methods or {}) do
+      local value = safeCall(bridge, methodName, ...)
+      if value ~= nil then
+        return value
+      end
+    end
+    return nil
+  end
+
+  local function tryList(methods)
+    local empty = {}
+    local value = tryCalls(methods, empty)
+    if value == nil then
+      value = tryCalls(methods)
+    end
+    if type(value) == "table" then
+      return value
+    end
+    return {}
+  end
+
   local stats = {
     available = true,
     name = name,
+    connected = safeCall(bridge, "isConnected"),
+    online = safeCall(bridge, "isOnline"),
     byKey = {},
     modCounts = {},
     craftables = {},
@@ -673,21 +701,22 @@ local function buildMeStats()
     fluidTotal = 0,
     cellCount = 0,
     cpuCount = 0,
-    totalItemStorage = safeNumber(safeCall(bridge, "getTotalItemStorage")),
-    usedItemStorage = safeNumber(safeCall(bridge, "getUsedItemStorage")),
-    availableItemStorage = safeNumber(safeCall(bridge, "getAvailableItemStorage")),
-    totalFluidStorage = safeNumber(safeCall(bridge, "getTotalFluidStorage")),
-    usedFluidStorage = safeNumber(safeCall(bridge, "getUsedFluidStorage")),
-    availableFluidStorage = safeNumber(safeCall(bridge, "getAvailableFluidStorage")),
-    energyStorage = safeNumber(safeCall(bridge, "getEnergyStorage")),
-    maxEnergyStorage = safeNumber(safeCall(bridge, "getMaxEnergyStorage")),
-    energyUsage = safeNumber(safeCall(bridge, "getEnergyUsage")),
+    totalItemStorage = safeNumber(tryCalls({ "getTotalItemStorage" })),
+    usedItemStorage = safeNumber(tryCalls({ "getUsedItemStorage" })),
+    availableItemStorage = safeNumber(tryCalls({ "getAvailableItemStorage" })),
+    totalFluidStorage = safeNumber(tryCalls({ "getTotalFluidStorage" })),
+    usedFluidStorage = safeNumber(tryCalls({ "getUsedFluidStorage" })),
+    availableFluidStorage = safeNumber(tryCalls({ "getAvailableFluidStorage" })),
+    energyStorage = safeNumber(tryCalls({ "getStoredEnergy", "getEnergyStorage" })),
+    maxEnergyStorage = safeNumber(tryCalls({ "getEnergyCapacity", "getMaxEnergyStorage" })),
+    energyUsage = safeNumber(tryCalls({ "getEnergyUsage" })),
+    avgPowerInjection = safeNumber(tryCalls({ "getAvgPowerInjection" })),
   }
 
-  local items = safeCall(bridge, "listItems") or {}
+  local items = tryList({ "listItems" })
   for _, item in pairs(items) do
     if item and item.name then
-      local count = tonumber(item.amount or item.count or 0) or 0
+      local count = tonumber(item.amount or item.count or item.qty or 0) or 0
       stats.totalItems = stats.totalItems + count
       mergeItem(stats.byKey, item, "me", count)
       local ns = namespaceOf(item.name)
@@ -695,12 +724,13 @@ local function buildMeStats()
     end
   end
 
-  local craftables = safeCall(bridge, "listCraftableItems") or {}
+  local craftables = tryList({ "listCraftableItems", "getPatterns" })
   for _, item in pairs(craftables) do
-    if item and item.name then
+    local nameKey = item and (item.name or (item.output and item.output.name))
+    if nameKey then
       stats.craftables[#stats.craftables + 1] = {
-        name = item.name,
-        displayName = item.displayName or baseNameOf(item.name),
+        name = nameKey,
+        displayName = item.displayName or (item.output and item.output.displayName) or baseNameOf(nameKey),
       }
     end
   end
@@ -709,10 +739,10 @@ local function buildMeStats()
     return tostring(a.displayName) < tostring(b.displayName)
   end)
 
-  local fluids = safeCall(bridge, "listFluid") or safeCall(bridge, "listFluids") or {}
+  local fluids = tryList({ "listFluids", "listFluid" })
   for _, fluid in pairs(fluids) do
     if fluid and fluid.name then
-      local amount = tonumber(fluid.amount or fluid.count or 0) or 0
+      local amount = tonumber(fluid.amount or fluid.count or fluid.qty or 0) or 0
       stats.fluidTotal = stats.fluidTotal + amount
       stats.fluids[#stats.fluids + 1] = {
         name = fluid.name,
@@ -729,8 +759,8 @@ local function buildMeStats()
     return tostring(a.displayName) < tostring(b.displayName)
   end)
 
-  stats.cells = safeCall(bridge, "listCells") or {}
-  stats.cpus = safeCall(bridge, "getCraftingCPUs") or {}
+  stats.cells = tryList({ "listCells" })
+  stats.cpus = tryList({ "getCraftingCPUs", "getCraftingTasks" })
 
   stats.order = sortItemMap(stats.byKey)
   stats.uniqueItems = #stats.order
@@ -885,7 +915,7 @@ local function buildPeripheralSummary()
     if hasType(name, "monitor") then
       summary.monitor = summary.monitor + 1
     end
-    if hasType(name, "meBridge") then
+    if isMEBridgeName(name) then
       summary.meBridge = summary.meBridge + 1
     end
     if hasType(name, "modem") then
@@ -2301,7 +2331,7 @@ local function handleMeBridgeCommand(args)
   end
 
   local name = args[2]
-  if peripheral.isPresent(name) and hasType(name, "meBridge") then
+  if peripheral.isPresent(name) and isMEBridgeName(name) then
     state.config.meBridgeDisabled = false
     state.config.meBridgeName = name
     saveConfig()
