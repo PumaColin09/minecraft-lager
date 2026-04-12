@@ -1,4 +1,4 @@
-local CONFIG_FILE = "lager_fs_auto_config.txt"
+local CONFIG_FILE = "lager_me_prio_config.txt"
 local ROLE_MARKER_SLOT = 1
 local DEFAULT_MONITOR_SCALE = 0.5
 local DEFAULT_SCAN_INTERVAL = 8
@@ -19,6 +19,9 @@ local state = {
   lastPageSwitch = 0,
   lastSupportRun = 0,
   lastSupportMoved = 0,
+  lastSupportMovedPriority = 0,
+  lastSupportMovedMe = 0,
+  lastSupportTouched = 0,
   lastSupportNote = "-",
   config = {
     monitorName = nil,
@@ -30,7 +33,6 @@ local state = {
     pageInterval = DEFAULT_PAGE_INTERVAL,
     ioName = nil,
     priorityName = nil,
-    overflowName = nil,
     supportEnabled = true,
     supportInterval = DEFAULT_SUPPORT_INTERVAL,
   },
@@ -337,9 +339,6 @@ local function loadConfig()
   if type(data.priorityName) == "string" then
     state.config.priorityName = data.priorityName
   end
-  if type(data.overflowName) == "string" then
-    state.config.overflowName = data.overflowName
-  end
   if type(data.supportEnabled) == "boolean" then
     state.config.supportEnabled = data.supportEnabled
   end
@@ -601,10 +600,13 @@ local function buildSupportStatus()
     enabled = state.config.supportEnabled and true or false,
     ioName = resolveIoName(),
     priorityName = resolvePriorityName(),
-    overflowName = resolveOverflowName(),
+    meBridgeName = resolveMeBridgeName(),
     interval = state.config.supportInterval,
     lastRun = state.lastSupportRun,
     lastMoved = state.lastSupportMoved,
+    lastMovedPriority = state.lastSupportMovedPriority or 0,
+    lastMovedMe = state.lastSupportMovedMe or 0,
+    lastTouched = state.lastSupportTouched or 0,
     lastNote = state.lastSupportNote,
   }
 end
@@ -620,41 +622,104 @@ local function sortedSlotKeys(list)
   return keys
 end
 
-local function moveItemsToTarget(source, targetName, overflowName)
-  local moved = 0
-  local touched = 0
+local function slotCount(inv, slot)
+  local list = safeCall(inv, "list") or {}
+  local item = list and list[slot] or nil
+  return tonumber(item and item.count or 0) or 0
+end
 
-  if not source or not targetName or not hasMethod(source, "pushItems") then
-    return moved, touched
+local function buildPriorityItemSet(target)
+  local out = {}
+  if not target then
+    return out
   end
 
-  local list = safeCall(source, "list") or {}
-  for _, slot in ipairs(sortedSlotKeys(list)) do
-    local basic = list[slot]
-    if basic and basic.name and tonumber(basic.count or 0) > 0 then
-      local detail = safeCall(source, "getItemDetail", slot) or basic
-      local isMarker = (slot == ROLE_MARKER_SLOT and parseMarker(detail) ~= nil)
-      if not isMarker then
-        local movedNow = safeNumber(safeCall(source, "pushItems", targetName, slot)) or 0
-        if movedNow <= 0 and overflowName and overflowName ~= "" then
-          movedNow = safeNumber(safeCall(source, "pushItems", overflowName, slot)) or 0
-        end
-        if movedNow > 0 then
-          moved = moved + movedNow
-          touched = touched + 1
-        end
+  local list = safeCall(target, "list") or {}
+  for slot, item in pairs(list) do
+    if item and item.name and tonumber(item.count or 0) > 0 then
+      local detail = safeCall(target, "getItemDetail", slot) or item
+      local key = tostring(detail.name)
+      out[key] = true
+      if detail.fingerprint then
+        out[key .. "#" .. tostring(detail.fingerprint)] = true
       end
     end
   end
 
-  return moved, touched
+  return out
+end
+
+local function isPriorityItem(detail, prioritySet)
+  if not detail or not detail.name then
+    return false
+  end
+
+  if prioritySet[tostring(detail.name)] then
+    return true
+  end
+
+  if detail.fingerprint and prioritySet[tostring(detail.name) .. "#" .. tostring(detail.fingerprint)] then
+    return true
+  end
+
+  return false
+end
+
+local function buildBridgeFilter(detail, slot, count)
+  local filter = {
+    name = detail.name,
+    count = math.max(1, math.floor(tonumber(count) or tonumber(detail.count) or 1)),
+    fromSlot = tonumber(slot),
+    type = "item",
+  }
+
+  if detail.fingerprint then
+    filter.fingerprint = detail.fingerprint
+  end
+
+  if detail.components then
+    filter.components = detail.components
+  elseif detail.nbt then
+    filter.nbt = detail.nbt
+  end
+
+  return filter
+end
+
+local function moveSlotToMe(bridge, ioName, source, slot, detail)
+  if not bridge or not ioName or not source then
+    return 0
+  end
+
+  local before = slotCount(source, slot)
+  if before <= 0 then
+    return 0
+  end
+
+  local filter = buildBridgeFilter(detail, slot, before)
+  safeCall(bridge, "importItem", filter, ioName)
+  local after = slotCount(source, slot)
+  local moved = math.max(0, before - after)
+
+  if moved <= 0 and detail and detail.name and before > 0 then
+    safeCall(bridge, "importItem", {
+      name = detail.name,
+      count = before,
+      fromSlot = tonumber(slot),
+      type = "item",
+    }, ioName)
+    after = slotCount(source, slot)
+    moved = math.max(0, before - after)
+  end
+
+  return moved
 end
 
 local function runSupportMove(silent)
   local support = buildSupportStatus()
 
   if not support.enabled then
-    state.lastSupportNote = "Support aus"
+    state.lastSupportNote = "Sortierung aus"
     return 0
   end
 
@@ -667,17 +732,17 @@ local function runSupportMove(silent)
   end
 
   if not support.priorityName then
-    state.lastSupportNote = "Kein Prio-Ziel"
+    state.lastSupportNote = "Kein Controller gefunden"
     if not silent then
-      print("Kein Prio-Ziel gefunden.")
+      print("Kein Functional-Storage-Controller gefunden.")
     end
     return 0
   end
 
   if support.ioName == support.priorityName then
-    state.lastSupportNote = "I/O und Prio identisch"
+    state.lastSupportNote = "I/O und Controller identisch"
     if not silent then
-      print("I/O-Kiste und Prio-Ziel duerfen nicht dasselbe Inventar sein.")
+      print("I/O-Kiste und Controller duerfen nicht dasselbe Inventar sein.")
     end
     return 0
   end
@@ -691,28 +756,87 @@ local function runSupportMove(silent)
     return 0
   end
 
-  local moved, touched = moveItemsToTarget(io, support.priorityName, support.overflowName)
-  state.lastSupportRun = nowMs()
-  state.lastSupportMoved = moved
+  local controller = safeWrap(support.priorityName)
+  if not controller then
+    state.lastSupportNote = "Controller nicht erreichbar"
+    if not silent then
+      print("Controller konnte nicht geoeffnet werden.")
+    end
+    return 0
+  end
 
-  if moved > 0 then
-    local targetLabel = support.priorityName
-    if support.overflowName and support.overflowName ~= "" then
-      state.lastSupportNote = "Zuletzt " .. formatCount(moved) .. " Items einsortiert"
-    else
-      state.lastSupportNote = "Zuletzt " .. formatCount(moved) .. " Items -> " .. targetLabel
-    end
-    if not silent then
-      print("Einsortiert: " .. formatCount(moved) .. " Items aus " .. support.ioName .. " (" .. tostring(touched) .. " Stapel bewegt).")
-    end
-  else
-    state.lastSupportNote = "Nichts zu bewegen"
-    if not silent then
-      print("Nichts bewegt. Entweder war die I/O leer oder der Controller nimmt gerade nichts an.")
+  local bridge = nil
+  if support.meBridgeName then
+    bridge = safeWrap(support.meBridgeName)
+  end
+
+  local prioritySet = buildPriorityItemSet(controller)
+  local list = safeCall(io, "list") or {}
+  local movedTotal = 0
+  local movedPriority = 0
+  local movedMe = 0
+  local touched = 0
+
+  for _, slot in ipairs(sortedSlotKeys(list)) do
+    local basic = list[slot]
+    if basic and basic.name and tonumber(basic.count or 0) > 0 then
+      local detail = safeCall(io, "getItemDetail", slot) or basic
+      local isMarker = (slot == ROLE_MARKER_SLOT and parseMarker(detail) ~= nil)
+      if not isMarker then
+        local touchedSlot = false
+
+        if isPriorityItem(detail, prioritySet) then
+          local movedNow = safeNumber(safeCall(io, "pushItems", support.priorityName, slot)) or 0
+          if movedNow > 0 then
+            movedPriority = movedPriority + movedNow
+            movedTotal = movedTotal + movedNow
+            touchedSlot = true
+          end
+        end
+
+        local remaining = slotCount(io, slot)
+        if remaining > 0 and bridge and hasMethod(bridge, "importItem") then
+          local movedNow = moveSlotToMe(bridge, support.ioName, io, slot, detail)
+          if movedNow > 0 then
+            movedMe = movedMe + movedNow
+            movedTotal = movedTotal + movedNow
+            touchedSlot = true
+          end
+        end
+
+        if touchedSlot then
+          touched = touched + 1
+        end
+      end
     end
   end
 
-  return moved
+  state.lastSupportRun = nowMs()
+  state.lastSupportMoved = movedTotal
+  state.lastSupportMovedPriority = movedPriority
+  state.lastSupportMovedMe = movedMe
+  state.lastSupportTouched = touched
+
+  if movedTotal > 0 then
+    state.lastSupportNote = "Controller " .. formatCount(movedPriority) .. " | ME " .. formatCount(movedMe)
+    if not silent then
+      print("Sortiert: " .. formatCount(movedPriority) .. " -> Controller | " .. formatCount(movedMe) .. " -> ME (" .. tostring(touched) .. " Stapel)")
+    end
+  else
+    if bridge then
+      state.lastSupportNote = "Nichts bewegt"
+      if not silent then
+        print("Nichts bewegt. I/O leer oder weder Controller noch ME konnten etwas annehmen.")
+      end
+    else
+      state.lastSupportNote = "ME Bridge fehlt"
+      if not silent then
+        print("Keine ME Bridge gefunden. Nur Controller-Priorisierung aktiv.")
+      end
+    end
+  end
+
+  return movedTotal
 end
 
 
@@ -954,7 +1078,7 @@ local function buildMeStats()
     avgPowerInjection = safeNumber(tryCalls({ "getAvgPowerInjection" })),
   }
 
-  local items = tryList({ "listItems" })
+  local items = tryList({ "listItems", "getItems" })
   for _, item in pairs(items) do
     if item and item.name then
       local count = tonumber(item.amount or item.count or item.qty or 0) or 0
@@ -965,7 +1089,7 @@ local function buildMeStats()
     end
   end
 
-  local craftables = tryList({ "listCraftableItems", "getPatterns" })
+  local craftables = tryList({ "listCraftableItems", "getCraftableItems", "getPatterns" })
   for _, item in pairs(craftables) do
     local nameKey = item and (item.name or (item.output and item.output.name))
     if nameKey then
@@ -980,7 +1104,7 @@ local function buildMeStats()
     return tostring(a.displayName) < tostring(b.displayName)
   end)
 
-  local fluids = tryList({ "listFluids", "listFluid" })
+  local fluids = tryList({ "listFluids", "listFluid", "getFluids" })
   for _, fluid in pairs(fluids) do
     if fluid and fluid.name then
       local amount = tonumber(fluid.amount or fluid.count or fluid.qty or 0) or 0
@@ -1304,8 +1428,8 @@ local function buildMonitorPages(snapshot)
     "Lokale Slots: " .. formatCount(localStats.usedSlots) .. "/" .. formatCount(localStats.totalSlots) .. " (" .. formatPercent(localStats.usedSlots, localStats.totalSlots) .. ")",
     "Lokale Items: " .. formatCount(localStats.totalItems),
     "Lokale Typen: " .. formatCount(localStats.uniqueItems),
-    "Support: " .. (support.enabled and "AN" or "AUS"),
-    "Prio-Ziel: " .. (support.priorityName or "nicht gesetzt"),
+    "Sortierung: " .. (support.enabled and "AN" or "AUS"),
+    "Controller: " .. (support.priorityName or "nicht gesetzt"),
     "ME Bridge: " .. (meStats.available and meStats.name or "nicht gefunden"),
     "ME Items: " .. formatCount(meStats.totalItems),
     "Kombi Items: " .. formatCount(combined.totalItems),
@@ -1337,13 +1461,14 @@ local function buildMonitorPages(snapshot)
   addPage(pages, "Lager", storageLines, "storage")
 
   local supportLines = {
-    "Modus: " .. (support.enabled and "Support aktiv" or "nur Statistik"),
+    "Modus: " .. (support.enabled and "Auto-Sortierung aktiv" or "nur Statistik"),
     "I/O: " .. (support.ioName or "nicht gefunden"),
-    "Prio: " .. (support.priorityName or "nicht gefunden"),
-    "Overflow: " .. (support.overflowName or "-"),
+    "Controller: " .. (support.priorityName or "nicht gefunden"),
+    "ME Bridge: " .. (support.meBridgeName or "nicht gefunden"),
     "Intervall: " .. tostring(support.interval) .. "s",
     "Letzter Lauf: " .. formatSince(support.lastRun),
-    "Zuletzt bewegt: " .. formatCount(support.lastMoved),
+    "Zum Controller: " .. formatCount(support.lastMovedPriority or 0),
+    "Zur ME: " .. formatCount(support.lastMovedMe or 0),
     "Info: " .. tostring(support.lastNote or "-"),
   }
   addPage(pages, "Support", supportLines, "support")
@@ -2199,9 +2324,11 @@ local function showStatus()
   print("ME craftbar:      " .. formatCount(snapshot.me.craftableCount))
   print("Kombi Items:      " .. formatCount(snapshot.combined.totalItems))
   print("Kombi Typen:      " .. formatCount(snapshot.combined.uniqueItems))
-  print("Support-Modus:    " .. ((snapshot.support and snapshot.support.enabled) and "AN" or "AUS"))
+  print("Sortierung:       " .. ((snapshot.support and snapshot.support.enabled) and "AN" or "AUS"))
   print("I/O Kiste:        " .. ((snapshot.support and snapshot.support.ioName) or "nicht gesetzt"))
-  print("Prio-Ziel:        " .. ((snapshot.support and snapshot.support.priorityName) or "nicht gesetzt"))
+  print("Controller:       " .. ((snapshot.support and snapshot.support.priorityName) or "nicht gesetzt"))
+  print("Zuletzt Ctrl:     " .. formatCount((snapshot.support and snapshot.support.lastMovedPriority) or 0))
+  print("Zuletzt ME:       " .. formatCount((snapshot.support and snapshot.support.lastMovedMe) or 0))
   print("Zuletzt bewegt:   " .. formatCount((snapshot.support and snapshot.support.lastMoved) or 0))
   print("Energie-Quellen:  " .. formatCount(#snapshot.energy.sources))
   print("Letzter Scan:     " .. formatSince(snapshot.time))
@@ -2475,56 +2602,41 @@ local function showMonitorStatus()
 end
 
 local function showHelp()
-  printSection("Statistik-Modus")
-  print("Dieses Script bewegt keine Items.")
-  print("Es liest nur Lager-, ME- und Stromdaten aus.")
+  printSection("Auto-Sortierung + Statistik")
+  print("Dieses Script sortiert automatisch aus der I/O-Kiste.")
+  print("Items, die bereits im Functional-Storage-Controller liegen,")
+  print("gehen zuerst dort hinein. Alles andere geht in die ME.")
   print("")
-  print("Befehle:")
+  print("Wenige wichtige Befehle:")
   print("  help / hilfe             - Hilfe anzeigen")
-  print("  scan                     - sofort neu scannen")
   print("  status                   - Uebersicht")
-  print("  support                  - Support-Status")
-  print("  support on/off           - Support-Modus schalten")
-  print("  support run              - I/O sofort ins Prio-Ziel bewegen")
-  print("  support interval <sec>   - Sortier-Intervall setzen")
-  print("  io [auto|<name>]         - I/O-Kiste setzen/auto")
-  print("  prio [auto|<name>]       - Functional-Storage-Ziel setzen/auto")
-  print("  overflow [off|<name>]    - optionales Fallback-Ziel")
-  print("  top [n]                  - groesste Itemstapel")
-  print("  mods [n]                 - Mod-Statistik")
-  print("  inv [n]                  - lokale Inventare")
-  print("  me                       - ME-Details")
-  print("  fluids [n]               - ME-Fluids")
-  print("  craft [n]                - craftbare ME-Items")
-  print("  energy / strom           - Stromdaten")
-  print("  find <text>              - Itemsuche lokal + ME")
-  print("  changes [n]              - Veraenderungen")
+  print("  scan                     - sofort neu scannen")
+  print("  sort                     - Sortierung sofort ausfuehren")
   print("  periph                   - erkannte Peripherals")
-  print("  monitor                  - Monitorstatus")
-  print("  monitor off              - Monitor deaktivieren")
-  print("  monitor auto             - groessten Monitor automatisch finden")
-  print("  marker: LAGER:IO / LAGER:OVERFLOW / LAGER:PRIO")
-  print("  monitor <name>           - festen Monitor setzen")
-  print("  monitor scale <wert>     - z.B. 0.5")
-  print("  mebridge off             - ME Bridge deaktivieren")
-  print("  mebridge auto            - ME Bridge automatisch finden")
-  print("  mebridge <name>          - feste ME Bridge setzen")
-  print("  intervall <scan> [page]  - Zeiten in Sekunden")
-  print("  seite <n|next|prev>      - Monitorseite manuell")
-  print("  marcel                   - kleines Easteregg auf dem Monitor")
+  print("  io [auto|<name>]         - I/O-Kiste setzen oder Marker nutzen")
+  print("  controller [auto|<name>] - Functional-Storage-Controller setzen")
+  print("  mebridge [auto|off|<name>] - ME Bridge setzen")
+  print("  monitor [auto|off|<name>]  - Monitor setzen")
+  print("  intervall <scan> [sort]  - Scan- und Sortierintervall")
   print("  exit                     - Script beenden")
+  print("")
+  print("Marker in Slot 1:")
+  print("  LAGER:IO")
+  print("  LAGER:PRIO")
+  print("  LAGER:IGNORE")
 end
-
 
 local function showSupportStatus()
   local support = buildSupportStatus()
-  printSection("Support-Modus")
+  printSection("Auto-Sortierung")
   print("Modus:           " .. (support.enabled and "AN" or "AUS"))
   print("I/O-Kiste:       " .. (support.ioName or "nicht gefunden"))
-  print("Prio-Ziel:       " .. (support.priorityName or "nicht gefunden"))
-  print("Overflow:        " .. (support.overflowName or "-"))
+  print("Controller:      " .. (support.priorityName or "nicht gefunden"))
+  print("ME Bridge:       " .. (support.meBridgeName or "nicht gefunden"))
   print("Intervall:       " .. tostring(support.interval) .. "s")
   print("Letzter Lauf:    " .. formatSince(support.lastRun))
+  print("Zum Controller:  " .. formatCount(support.lastMovedPriority or 0))
+  print("Zur ME:          " .. formatCount(support.lastMovedMe or 0))
   print("Zuletzt bewegt:  " .. formatCount(support.lastMoved))
   print("Hinweis:         " .. tostring(support.lastNote or "-"))
 end
@@ -2557,7 +2669,7 @@ end
 
 local function handlePriorityCommand(args)
   if not args[2] then
-    print("Prio-Ziel: " .. (resolvePriorityName() or "nicht gefunden"))
+    print("Controller: " .. (resolvePriorityName() or "nicht gefunden"))
     return
   end
 
@@ -2566,7 +2678,7 @@ local function handlePriorityCommand(args)
     state.config.priorityName = nil
     saveConfig()
     scanAll(true)
-    print("Prio-Ziel wird jetzt automatisch gesucht.")
+    print("Controller wird jetzt automatisch gesucht.")
     return
   end
 
@@ -2575,7 +2687,7 @@ local function handlePriorityCommand(args)
     state.config.priorityName = name
     saveConfig()
     scanAll(true)
-    print("Prio-Ziel gesetzt auf " .. name)
+    print("Controller gesetzt auf " .. name)
   else
     print("Inventar '" .. tostring(name) .. "' nicht gefunden.")
   end
@@ -2755,7 +2867,7 @@ end
 
 local function handleIntervalCommand(args)
   local scanValue = tonumber(args[2] or "")
-  local pageValue = tonumber(args[3] or "")
+  local sortValue = tonumber(args[3] or "")
 
   if not scanValue then
     print("Bitte mindestens das Scan-Intervall angeben.")
@@ -2763,12 +2875,12 @@ local function handleIntervalCommand(args)
   end
 
   state.config.scanInterval = math.max(2, math.floor(scanValue))
-  if pageValue then
-    state.config.pageInterval = math.max(2, math.floor(pageValue))
+  if sortValue then
+    state.config.supportInterval = math.max(1, math.floor(sortValue))
   end
 
   saveConfig()
-  print("Intervalle gesetzt: Scan " .. tostring(state.config.scanInterval) .. "s | Seitenwechsel " .. tostring(state.config.pageInterval) .. "s")
+  print("Intervalle gesetzt: Scan " .. tostring(state.config.scanInterval) .. "s | Sortierung " .. tostring(state.config.supportInterval) .. "s")
 end
 
 local function handlePageCommand(args)
@@ -2828,67 +2940,36 @@ local function handleCommand(line)
     renderMonitor()
   elseif cmd == "status" then
     showStatus()
-  elseif cmd == "top" then
-    showTop(args[2])
-  elseif cmd == "support" then
-    handleSupportCommand(args)
-  elseif cmd == "io" then
-    handleIoCommand(args)
-  elseif cmd == "prio" or cmd == "priority" or cmd == "controller" then
-    handlePriorityCommand(args)
-  elseif cmd == "overflow" then
-    handleOverflowCommand(args)
-  elseif cmd == "mods" then
-    showMods(args[2])
-  elseif cmd == "inv" or cmd == "inventare" or cmd == "lager" then
-    showInventories(args[2])
-  elseif cmd == "me" then
-    showMe()
-  elseif cmd == "fluids" then
-    showFluids(args[2])
-  elseif cmd == "craft" or cmd == "craftables" then
-    showCraftables(args[2])
-  elseif cmd == "energy" or cmd == "strom" then
-    showEnergy()
-  elseif cmd == "find" or cmd == "suche" then
-    local term = trim(line:sub(#args[1] + 1))
-    showFind(term)
-  elseif cmd == "changes" or cmd == "aenderungen" or cmd == "anderungen" then
-    showChanges(args[2])
-  elseif cmd == "periph" or cmd == "peripherals" then
-    showPeripherals()
-  elseif cmd == "einsortieren" then
+  elseif cmd == "sort" or cmd == "einsortieren" then
     local moved = runSupportMove(false)
     if moved > 0 then
       scanAll(true)
       renderMonitor()
     end
-  elseif cmd == "monitor" then
-    handleMonitorCommand(args)
+  elseif cmd == "periph" or cmd == "peripherals" then
+    showPeripherals()
+  elseif cmd == "io" then
+    handleIoCommand(args)
+  elseif cmd == "controller" or cmd == "prio" then
+    handlePriorityCommand(args)
   elseif cmd == "mebridge" then
     handleMeBridgeCommand(args)
+  elseif cmd == "monitor" then
+    handleMonitorCommand(args)
   elseif cmd == "intervall" or cmd == "interval" then
     handleIntervalCommand(args)
-  elseif cmd == "seite" or cmd == "page" then
-    handlePageCommand(args)
-  elseif cmd == "marcel" or cmd == "easteregg" or cmd == "party" then
-    state.easterUnlocked = not state.easterUnlocked
-    if state.easterUnlocked then
-      playSecretJingle()
-      local pages = buildMonitorPages(state.snapshot)
-      state.page = #pages
-      print("Marcel-Modus aktiviert. Schau auf den Monitor.")
-    else
-      state.page = 1
-      print("Marcel-Modus deaktiviert.")
-    end
-    renderMonitor()
+  elseif cmd == "support" then
+    showSupportStatus()
+  elseif cmd == "me" then
+    showMe()
+  elseif cmd == "energy" or cmd == "strom" then
+    showEnergy()
   elseif cmd == "exit" or cmd == "quit" or cmd == "ende" then
     state.running = false
     return false
   else
     print("Unbekannter Befehl: " .. cmd)
-    print("Mit 'help' bekommst du alle Befehle.")
+    print("Mit 'help' bekommst du die kurzen Befehle.")
   end
 
   return true
@@ -2925,12 +3006,10 @@ local function backgroundLoop()
 end
 
 local function commandLoop()
-  print("Lager Statistik gestartet.")
-  print("Statistiken laufen immer; optionaler Support-Modus kann I/O -> Functional Storage einsortieren.")
-  print("ME Bridge und Stromdaten werden automatisch erkannt, wenn vorhanden.")
-  print("Monitor auto waehlt jetzt den groessten gefundenen Monitor.")
-  print("Fuer den Support-Modus: 'io <name>', 'prio <name>', dann 'support on'.")
-  print("Mit 'help' bekommst du alle Befehle.")
+  print("Lager Auto-Sortierung gestartet.")
+  print("I/O -> Controller zuerst, Rest -> ME System.")
+  print("ME Bridge, Controller und Monitor werden automatisch erkannt, wenn vorhanden.")
+  print("Mit 'help' bekommst du die kurzen Befehle.")
   print("")
 
   scanAll(true)
@@ -2950,5 +3029,6 @@ local function commandLoop()
 end
 
 loadConfig()
+state.config.supportEnabled = true
 state.lastPageSwitch = nowMs()
 parallel.waitForAny(commandLoop, backgroundLoop)
