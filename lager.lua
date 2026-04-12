@@ -1,66 +1,27 @@
-local MONITOR_NAME = nil
-local MONITOR_SCALE = 0.5
-local PAGE_INTERVAL = 4
-local SCAN_INTERVAL = 5
-local TOPOLOGY_REFRESH_INTERVAL = 10
+
+local CONFIG_FILE = "lager_stats_config.txt"
 local ROLE_MARKER_SLOT = 1
-local MAP_FILE = "mod_map.txt"
-local FINAL_LOCK_FILE = "lager_final_done.txt"
-
-local SPECIAL_TARGETS = {
-  ores = nil,
-  stone = nil,
-  wood = nil,
-  redstone = nil,
-  food = nil,
-  farming = nil,
-  mobdrops = nil,
-  tools = nil,
-  misc = nil,
-  overflow = nil,
-}
-
-local SOURCE_CHEST_TYPES = {
-  ["minecraft:chest"] = true,
-  ["minecraft:trapped_chest"] = true,
-}
-
-local GROUP_LABELS = {
-  ores = "Erze & Metalle",
-  stone = "Stein & Erde",
-  wood = "Holz",
-  redstone = "Redstone",
-  food = "Essen",
-  farming = "Pflanzen",
-  mobdrops = "Mobdrops",
-  tools = "Werkzeuge",
-  misc = "Verschiedenes",
-}
+local DEFAULT_MONITOR_SCALE = 0.5
+local DEFAULT_SCAN_INTERVAL = 8
+local DEFAULT_PAGE_INTERVAL = 6
+local MAX_MONITOR_LINES = 18
 
 local state = {
-  monitor = nil,
-  poolNames = {},
-  storageNames = {},
-  sourceNames = {},
-  modMap = {},
-  pinnedTargets = {},
-  overflowName = nil,
-  ignoredNames = {},
-  markers = {},
-  candidateInventories = {},
-  freePool = {},
-  index = {},
-  order = {},
-  totalItems = 0,
-  totalStacks = 0,
-  pendingSourceItems = 0,
-  pendingSourceStacks = 0,
+  running = true,
+  page = 1,
+  lastPageSwitch = 0,
   lastScan = 0,
-  lastTopologyCheck = 0,
-  topologySig = "",
-  markerSig = "",
-  dirty = true,
-  migrationLocked = false,
+  snapshot = nil,
+  previous = nil,
+  config = {
+    monitorName = nil,
+    monitorDisabled = false,
+    monitorScale = DEFAULT_MONITOR_SCALE,
+    meBridgeName = nil,
+    meBridgeDisabled = false,
+    scanInterval = DEFAULT_SCAN_INTERVAL,
+    pageInterval = DEFAULT_PAGE_INTERVAL,
+  },
 }
 
 local function nowMs()
@@ -71,44 +32,18 @@ local function trim(text)
   return (tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
+local function safeNumber(value)
+  value = tonumber(value)
+  if value then
+    return value
+  end
+  return nil
+end
+
 local function sortedNames()
   local names = peripheral.getNames()
   table.sort(names)
   return names
-end
-
-local function joinList(values, sep)
-  local out = {}
-  for _, value in ipairs(values or {}) do
-    out[#out + 1] = tostring(value)
-  end
-  return table.concat(out, sep or ", ")
-end
-
-local function uniqueList(list)
-  local out = {}
-  local seen = {}
-
-  for _, value in ipairs(list or {}) do
-    if value and value ~= "" and not seen[value] then
-      seen[value] = true
-      out[#out + 1] = value
-    end
-  end
-
-  return out
-end
-
-local function formatCount(n)
-  local s = tostring(n or 0)
-  local out = ""
-
-  while #s > 3 do
-    out = "." .. s:sub(-3) .. out
-    s = s:sub(1, -4)
-  end
-
-  return s .. out
 end
 
 local function clip(text, maxLen)
@@ -129,57 +64,108 @@ local function clip(text, maxLen)
   return text:sub(1, maxLen - 1) .. ">"
 end
 
-local function isInventory(name)
-  return name and peripheral.isPresent(name) and peripheral.hasType(name, "inventory")
+local function formatCount(n)
+  n = math.floor(tonumber(n) or 0)
+  local s = tostring(n)
+  local out = ""
+
+  while #s > 3 do
+    out = "." .. s:sub(-3) .. out
+    s = s:sub(1, -4)
+  end
+
+  return s .. out
 end
 
-local function invSize(inv)
-  if not inv or not inv.size then
-    return 0
+local function formatMaybeCount(n)
+  if n == nil then
+    return "-"
   end
-
-  local ok, value = pcall(inv.size)
-  if ok and value then
-    return value
-  end
-
-  return 0
+  return formatCount(n)
 end
 
-local function invList(inv)
-  if not inv or not inv.list then
-    return {}
+local function formatPercent(part, total)
+  part = tonumber(part) or 0
+  total = tonumber(total) or 0
+
+  if total <= 0 then
+    return "0.0%"
   end
 
-  local ok, value = pcall(inv.list)
-  if ok and type(value) == "table" then
-    return value
-  end
-
-  return {}
+  return string.format("%.1f%%", (part / total) * 100)
 end
 
-local function invDetail(inv, slot)
-  if not inv or not inv.getItemDetail then
-    return nil
+local function formatRate(n)
+  if n == nil then
+    return "-"
   end
-
-  local ok, value = pcall(inv.getItemDetail, slot)
-  if ok then
-    return value
-  end
-
-  return nil
+  return formatCount(n) .. " FE/t"
 end
 
-local function hasAnyType(name, typeSet)
-  for typeName in pairs(typeSet or {}) do
-    if peripheral.hasType(name, typeName) then
-      return true
-    end
+local function formatEnergy(stored, capacity)
+  if stored == nil and capacity == nil then
+    return "-"
   end
 
-  return false
+  if capacity and capacity > 0 then
+    return formatCount(stored or 0) .. "/" .. formatCount(capacity) .. " FE"
+  end
+
+  return formatCount(stored or 0) .. " FE"
+end
+
+local function formatSince(ms)
+  if not ms or ms <= 0 then
+    return "-"
+  end
+
+  local sec = math.floor((nowMs() - ms) / 1000)
+  if sec < 60 then
+    return tostring(sec) .. "s"
+  end
+
+  local min = math.floor(sec / 60)
+  local rest = sec % 60
+  return tostring(min) .. "m " .. tostring(rest) .. "s"
+end
+
+local function joinList(list, sep)
+  local out = {}
+  for _, value in ipairs(list or {}) do
+    out[#out + 1] = tostring(value)
+  end
+  return table.concat(out, sep or ", ")
+end
+
+local function namespaceOf(itemName)
+  return tostring(itemName or ""):match("^(.-):") or "unknown"
+end
+
+local function baseNameOf(itemName)
+  return tostring(itemName or ""):match(":(.+)$") or tostring(itemName or "")
+end
+
+local function prettyModName(ns)
+  local map = {
+    minecraft = "Minecraft",
+    ae2 = "Applied Energistics 2",
+    advancedperipherals = "Advanced Peripherals",
+    computercraft = "CC: Tweaked",
+    create = "Create",
+    mekanism = "Mekanism",
+    storagedrawers = "Storage Drawers",
+    refinedstorage = "Refined Storage",
+    farmersdelight = "Farmer's Delight",
+  }
+
+  if map[ns] then
+    return map[ns]
+  end
+
+  ns = tostring(ns or ""):gsub("_", " ")
+  return (ns:gsub("(%a)([%w ]*)", function(a, b)
+    return a:upper() .. b:lower()
+  end))
 end
 
 local function listPeripheralTypes(name)
@@ -198,17 +184,20 @@ local function listPeripheralTypes(name)
   return out
 end
 
-local function namespaceOf(itemName)
-  return tostring(itemName):match("^(.-):") or "unknown"
-end
+local function hasType(name, typeName)
+  if not name or not peripheral.isPresent(name) then
+    return false
+  end
 
-local function baseNameOf(itemName)
-  return tostring(itemName):match(":(.+)$") or tostring(itemName)
-end
+  if peripheral.hasType then
+    local ok, value = pcall(peripheral.hasType, name, typeName)
+    if ok then
+      return value and true or false
+    end
+  end
 
-local function containsAny(text, parts)
-  for _, part in ipairs(parts or {}) do
-    if text:find(part, 1, true) then
+  for _, value in ipairs(listPeripheralTypes(name)) do
+    if value == typeName then
       return true
     end
   end
@@ -216,1515 +205,1485 @@ local function containsAny(text, parts)
   return false
 end
 
-local function prettyModName(ns)
-  local map = {
-    create = "Create",
-    mekanism = "Mekanism",
-    farmersdelight = "Farmer's Delight",
-    supplementaries = "Supplementaries",
-    computercraft = "CC",
-    storagedrawers = "Storage Drawers",
-    thermal = "Thermal",
-    immersiveengineering = "Immersive Engineering",
-    ae2 = "Applied Energistics 2",
-  }
-
-  if map[ns] then
-    return map[ns]
-  end
-
-  ns = tostring(ns or ""):gsub("_", " ")
-  return (ns:gsub("(%a)([%w ]*)", function(a, b)
-    return a:upper() .. b:lower()
-  end))
-end
-
-local function routeLabel(routeKey)
-  routeKey = tostring(routeKey or "")
-
-  if routeKey == "overflow" then
-    return "Overflow"
-  end
-
-  local group = routeKey:match("^group:(.+)$")
-  if group then
-    return GROUP_LABELS[group] or ("Gruppe " .. group)
-  end
-
-  local mod = routeKey:match("^mod:(.+)$")
-  if mod then
-    return prettyModName(mod)
-  end
-
-  return routeKey
-end
-
-local function normalizeRouteKey(key)
-  key = trim(tostring(key or "")):lower()
-  if key == "" then
+local function safeWrap(name)
+  if not name or not peripheral.isPresent(name) then
     return nil
   end
 
-  key = key:gsub("^%[", ""):gsub("%]$", "")
-
-  if key == "ignore" or key == "off" then
-    return "ignore"
-  end
-
-  if key == "overflow" then
-    return "overflow"
-  end
-
-  local group = key:match("^group:(.+)$") or key:match("^gruppe:(.+)$")
-  if group then
-    group = trim(group)
-    if GROUP_LABELS[group] then
-      return "group:" .. group
-    end
-    return nil
-  end
-
-  local mod = key:match("^mod:(.+)$")
-  if mod then
-    mod = trim(mod)
-    if mod ~= "" then
-      return "mod:" .. mod
-    end
-    return nil
-  end
-
-  if GROUP_LABELS[key] then
-    return "group:" .. key
-  end
-
-  return "mod:" .. key
-end
-
-local function parseMarkerText(text)
-  local raw = trim(text)
-  if raw == "" then
-    return nil
-  end
-
-  local normalized = raw:upper():gsub("%s+", "")
-  normalized = normalized:gsub("^%[", ""):gsub("%]$", "")
-  if not normalized:find("^LAGER:") then
-    return nil
-  end
-
-  local body = normalized:sub(7)
-  if body == "IGNORE" or body == "OFF" then
-    return { kind = "ignore", label = "IGNORE" }
-  end
-
-  if body == "OVERFLOW" then
-    return { kind = "overflow", label = "OVERFLOW", routeKey = "overflow" }
-  end
-
-  if body == "IO" then
-    return { kind = "io", label = "IO" }
-  end
-
-  local group = body:match("^GROUP:(.+)$") or body:match("^GRUPPE:(.+)$")
-  if group then
-    group = group:lower()
-    if GROUP_LABELS[group] then
-      return {
-        kind = "route",
-        label = "GROUP:" .. group,
-        routeKey = "group:" .. group,
-      }
-    end
-    return nil
-  end
-
-  local mod = body:match("^MOD:(.+)$")
-  if mod and mod ~= "" then
-    mod = mod:lower()
-    return {
-      kind = "route",
-      label = "MOD:" .. mod,
-      routeKey = "mod:" .. mod,
-    }
-  end
-
-  local plain = body:lower()
-  if GROUP_LABELS[plain] then
-    return {
-      kind = "route",
-      label = "GROUP:" .. plain,
-      routeKey = "group:" .. plain,
-    }
+  local ok, value = pcall(peripheral.wrap, name)
+  if ok then
+    return value
   end
 
   return nil
 end
 
-local function readInventoryMarker(name)
-  if not isInventory(name) then
-    return nil
-  end
-
-  local inv = peripheral.wrap(name)
-  if not inv then
-    return nil
-  end
-
-  local detail = invDetail(inv, ROLE_MARKER_SLOT)
-  if not detail then
-    return nil
-  end
-
-  local marker = parseMarkerText(detail.displayName or detail.name)
-  if marker then
-    marker.itemName = detail.name
-    marker.displayName = detail.displayName or detail.name
-  end
-
-  return marker
+local function hasMethod(object, methodName)
+  return object and type(object[methodName]) == "function"
 end
 
-local function inventorySignature()
-  local out = {}
+local function safeCall(object, methodName, ...)
+  if not hasMethod(object, methodName) then
+    return nil
+  end
 
-  for _, name in ipairs(sortedNames()) do
-    if isInventory(name) then
-      local inv = peripheral.wrap(name)
-      out[#out + 1] = tostring(name) .. "=" .. tostring(invSize(inv))
+  local ok, a, b, c, d = pcall(object[methodName], ...)
+  if ok then
+    return a, b, c, d
+  end
+
+  return nil
+end
+
+local function firstNumericCall(object, methods)
+  for _, methodName in ipairs(methods or {}) do
+    local value = safeNumber(safeCall(object, methodName))
+    if value ~= nil then
+      return value, methodName
     end
   end
 
-  return table.concat(out, "|")
+  return nil, nil
 end
 
-local function markerSignature()
-  local out = {}
-
-  for _, name in ipairs(sortedNames()) do
-    if isInventory(name) then
-      local marker = readInventoryMarker(name)
-      if marker then
-        out[#out + 1] = tostring(name) .. "=" .. tostring(marker.label or marker.routeKey or marker.kind)
-      end
-    end
-  end
-
-  return table.concat(out, "|")
-end
-
-local function getMonitor()
-  if MONITOR_NAME and MONITOR_NAME ~= "" then
-    if peripheral.isPresent(MONITOR_NAME) and peripheral.hasType(MONITOR_NAME, "monitor") then
-      return peripheral.wrap(MONITOR_NAME)
-    end
+local function readFile(path)
+  if not fs.exists(path) then
     return nil
   end
 
-  return peripheral.find("monitor")
-end
-
-local function loadMap()
-  state.modMap = {}
-
-  if not fs.exists(MAP_FILE) then
-    return
-  end
-
-  local h = fs.open(MAP_FILE, "r")
+  local h = fs.open(path, "r")
   if not h then
-    return
+    return nil
   end
 
   local raw = h.readAll()
   h.close()
+  return raw
+end
+
+local function writeFile(path, text)
+  local h = fs.open(path, "w")
+  if not h then
+    return false
+  end
+
+  h.write(text or "")
+  h.close()
+  return true
+end
+
+local function loadConfig()
+  local raw = readFile(CONFIG_FILE)
+  if not raw or raw == "" then
+    return
+  end
 
   local data = textutils.unserialize(raw)
   if type(data) ~= "table" then
     return
   end
 
-  for key, invName in pairs(data) do
-    local routeKey = normalizeRouteKey(key)
-    if routeKey and type(invName) == "string" and invName ~= "" then
-      state.modMap[routeKey] = invName
-    end
+  if type(data.monitorName) == "string" then
+    state.config.monitorName = data.monitorName
+  end
+  if type(data.monitorDisabled) == "boolean" then
+    state.config.monitorDisabled = data.monitorDisabled
+  end
+  if tonumber(data.monitorScale) then
+    state.config.monitorScale = tonumber(data.monitorScale)
+  end
+  if type(data.meBridgeName) == "string" then
+    state.config.meBridgeName = data.meBridgeName
+  end
+  if type(data.meBridgeDisabled) == "boolean" then
+    state.config.meBridgeDisabled = data.meBridgeDisabled
+  end
+  if tonumber(data.scanInterval) then
+    state.config.scanInterval = math.max(2, math.floor(tonumber(data.scanInterval)))
+  end
+  if tonumber(data.pageInterval) then
+    state.config.pageInterval = math.max(2, math.floor(tonumber(data.pageInterval)))
   end
 end
 
-local function saveMap()
-  local h = fs.open(MAP_FILE, "w")
-  if not h then
+local function saveConfig()
+  writeFile(CONFIG_FILE, textutils.serialize(state.config))
+end
+
+local function resolveMonitorName()
+  if state.config.monitorDisabled then
+    return nil
+  end
+
+  if state.config.monitorName and state.config.monitorName ~= "" and peripheral.isPresent(state.config.monitorName) and hasType(state.config.monitorName, "monitor") then
+    return state.config.monitorName
+  end
+
+  for _, name in ipairs(sortedNames()) do
+    if hasType(name, "monitor") then
+      return name
+    end
+  end
+
+  return nil
+end
+
+local function resolveMeBridgeName()
+  if state.config.meBridgeDisabled then
+    return nil
+  end
+
+  if state.config.meBridgeName and state.config.meBridgeName ~= "" and peripheral.isPresent(state.config.meBridgeName) and hasType(state.config.meBridgeName, "meBridge") then
+    return state.config.meBridgeName
+  end
+
+  for _, name in ipairs(sortedNames()) do
+    if hasType(name, "meBridge") then
+      return name
+    end
+  end
+
+  return nil
+end
+
+local function parseMarker(detail)
+  if type(detail) ~= "table" then
+    return nil
+  end
+
+  local raw = trim(detail.displayName or detail.name)
+  if raw == "" then
+    return nil
+  end
+
+  local normalized = raw:upper():gsub("%s+", "")
+  normalized = normalized:gsub("^%[", ""):gsub("%]$", "")
+
+  if not normalized:find("^LAGER:") then
+    return nil
+  end
+
+  return normalized:sub(7)
+end
+
+local function inventoryMarker(name, inv)
+  if not inv then
+    return nil
+  end
+
+  local detail = safeCall(inv, "getItemDetail", ROLE_MARKER_SLOT)
+  if not detail then
+    return nil
+  end
+
+  return parseMarker(detail)
+end
+
+local function isIgnoredInventory(name, inv)
+  local marker = inventoryMarker(name, inv)
+  return marker == "IGNORE" or marker == "OFF"
+end
+
+local function buildItemKey(item)
+  local nbt = item.nbt or item.fingerprint or item.itemFingerprint or ""
+  return tostring(item.name or "unknown") .. "#" .. tostring(nbt)
+end
+
+local function mergeItem(map, detail, source, amount)
+  if not detail or not detail.name then
     return
   end
 
-  h.write(textutils.serialize(state.modMap))
-  h.close()
+  amount = tonumber(amount) or 0
+  if amount == 0 then
+    return
+  end
+
+  local key = buildItemKey(detail)
+  local entry = map[key]
+
+  if not entry then
+    entry = {
+      key = key,
+      name = detail.name,
+      displayName = detail.displayName or baseNameOf(detail.name),
+      mod = namespaceOf(detail.name),
+      localCount = 0,
+      meCount = 0,
+      totalCount = 0,
+    }
+    map[key] = entry
+  end
+
+  if source == "local" then
+    entry.localCount = entry.localCount + amount
+  elseif source == "me" then
+    entry.meCount = entry.meCount + amount
+  end
+
+  entry.totalCount = entry.localCount + entry.meCount
 end
 
-local function classifyCoreGroup(itemName)
-  local base = baseNameOf(itemName)
-
-  if base == "ancient_debris"
-    or base:find("_ore", 1, true)
-    or base:find("ore_", 1, true)
-    or base:find("raw_", 1, true)
-    or base:find("_raw", 1, true)
-    or base:find("_ingot", 1, true)
-    or base:find("_nugget", 1, true)
-  then
-    return "ores"
+local function sortItemMap(map)
+  local out = {}
+  for _, entry in pairs(map or {}) do
+    out[#out + 1] = entry
   end
 
-  local stoneExact = {
-    stone = true,
-    cobblestone = true,
-    deepslate = true,
-    cobbled_deepslate = true,
-    blackstone = true,
-    basalt = true,
-    andesite = true,
-    diorite = true,
-    granite = true,
-    tuff = true,
-    calcite = true,
-    dripstone_block = true,
-    netherrack = true,
-    end_stone = true,
-    sandstone = true,
-    red_sandstone = true,
-    gravel = true,
-    flint = true,
-    limestone = true,
-    marble = true,
-    scoria = true,
-    slate = true,
-    smooth_stone = true,
-    dirt = true,
-    coarse_dirt = true,
-    rooted_dirt = true,
-    podzol = true,
-    mycelium = true,
-    clay = true,
-    sand = true,
-    red_sand = true,
-    soul_sand = true,
-    soul_soil = true,
-    terracotta = true,
-  }
-
-  if stoneExact[base] then
-    return "stone"
-  end
-
-  local stoneParts = {
-    "cobblestone",
-    "deepslate",
-    "blackstone",
-    "basalt",
-    "andesite",
-    "diorite",
-    "granite",
-    "tuff",
-    "calcite",
-    "dripstone",
-    "netherrack",
-    "end_stone",
-    "sandstone",
-    "gravel",
-    "limestone",
-    "marble",
-    "scoria",
-    "slate",
-    "terracotta",
-    "concrete",
-    "dirt",
-    "sand",
-    "clay",
-  }
-
-  if containsAny(base, stoneParts) then
-    return "stone"
-  end
-
-  local woodParts = {
-    "_log",
-    "_wood",
-    "_planks",
-    "_stem",
-    "_hyphae",
-    "stripped_",
-    "leaves",
-    "sapling",
-    "bamboo",
-    "mangrove_roots",
-    "_boat",
-    "chest_boat",
-    "_slab",
-    "_stairs",
-    "_door",
-    "_trapdoor",
-    "_fence",
-    "_fence_gate",
-    "_button",
-    "_pressure_plate",
-    "_sign",
-    "_hanging_sign",
-  }
-
-  if containsAny(base, woodParts) then
-    return "wood"
-  end
-
-  return nil
-end
-
-local function classifyVanillaGroup(itemName)
-  local base = baseNameOf(itemName)
-
-  if containsAny(base, {
-    "redstone",
-    "repeater",
-    "comparator",
-    "observer",
-    "piston",
-    "hopper",
-    "dispenser",
-    "dropper",
-    "lever",
-    "tripwire_hook",
-    "daylight_detector",
-    "target",
-    "lightning_rod",
-    "sculk_sensor",
-    "calibrated_sculk_sensor",
-    "note_block",
-    "jukebox",
-  }) then
-    return "redstone"
-  end
-
-  if containsAny(base, {
-    "_sword",
-    "_pickaxe",
-    "_axe",
-    "_shovel",
-    "_hoe",
-    "_helmet",
-    "_chestplate",
-    "_leggings",
-    "_boots",
-    "shield",
-    "bow",
-    "crossbow",
-    "trident",
-    "fishing_rod",
-    "shears",
-    "flint_and_steel",
-    "brush",
-    "spyglass",
-    "compass",
-    "clock",
-    "elytra",
-  }) then
-    return "tools"
-  end
-
-  if containsAny(base, {
-    "apple",
-    "bread",
-    "stew",
-    "soup",
-    "pie",
-    "cookie",
-    "cake",
-    "melon_slice",
-    "dried_kelp",
-    "carrot",
-    "potato",
-    "beetroot",
-    "pumpkin_pie",
-    "sweet_berries",
-    "glow_berries",
-    "chorus_fruit",
-    "porkchop",
-    "beef",
-    "mutton",
-    "chicken",
-    "rabbit",
-    "cod",
-    "salmon",
-    "tropical_fish",
-    "pufferfish",
-    "golden_apple",
-    "golden_carrot",
-    "honey_bottle",
-  }) then
-    return "food"
-  end
-
-  if containsAny(base, {
-    "_seeds",
-    "wheat",
-    "carrot",
-    "potato",
-    "beetroot",
-    "pumpkin",
-    "melon",
-    "sugar_cane",
-    "bamboo",
-    "cactus",
-    "kelp",
-    "sapling",
-    "propagule",
-    "leaves",
-    "vine",
-    "flower",
-    "tulip",
-    "dandelion",
-    "poppy",
-    "orchid",
-    "allium",
-    "azure_bluet",
-    "oxeye_daisy",
-    "cornflower",
-    "lily_of_the_valley",
-    "sunflower",
-    "lilac",
-    "rose_bush",
-    "peony",
-    "moss",
-    "fern",
-    "grass",
-    "roots",
-  }) then
-    return "farming"
-  end
-
-  if containsAny(base, {
-    "rotten_flesh",
-    "bone",
-    "bone_meal",
-    "string",
-    "spider_eye",
-    "gunpowder",
-    "slime_ball",
-    "magma_cream",
-    "ender_pearl",
-    "blaze_rod",
-    "blaze_powder",
-    "ghast_tear",
-    "phantom_membrane",
-    "leather",
-    "feather",
-    "rabbit_hide",
-    "ink_sac",
-    "glow_ink_sac",
-    "nautilus_shell",
-    "prismarine_shard",
-    "prismarine_crystals",
-    "shulker_shell",
-    "echo_shard",
-  }) then
-    return "mobdrops"
-  end
-
-  return "misc"
-end
-
-local function routeKeyForItemName(itemName)
-  local group = classifyCoreGroup(itemName)
-  if group then
-    return "group:" .. group
-  end
-
-  local ns = namespaceOf(itemName)
-  if ns == "minecraft" then
-    return "group:" .. classifyVanillaGroup(itemName)
-  end
-
-  return "mod:" .. ns
-end
-
-local function formatDisplayEntry(value)
-  if type(value) == "table" then
-    local name = value.displayName or value.name or value.id or value.effect or value.key or tostring(value)
-
-    if value.level then
-      return tostring(name) .. " " .. tostring(value.level)
+  table.sort(out, function(a, b)
+    if a.totalCount ~= b.totalCount then
+      return a.totalCount > b.totalCount
     end
-
-    if value.amplifier then
-      return tostring(name) .. " " .. tostring(value.amplifier)
-    end
-
-    return tostring(name)
-  end
-
-  return tostring(value)
-end
-
-local function joinDisplayList(entries, maxItems)
-  if type(entries) ~= "table" or #entries == 0 then
-    return ""
-  end
-
-  local parts = {}
-  maxItems = maxItems or #entries
-
-  for i, value in ipairs(entries) do
-    if i > maxItems then
-      parts[#parts + 1] = "+" .. tostring(#entries - maxItems)
-      break
-    end
-
-    parts[#parts + 1] = formatDisplayEntry(value)
-  end
-
-  return table.concat(parts, ", ")
-end
-
-local function buildDescription(detail)
-  if not detail then
-    return ""
-  end
-
-  if detail.enchantments and #detail.enchantments > 0 then
-    return joinDisplayList(detail.enchantments, 3)
-  end
-
-  if detail.potionEffects and #detail.potionEffects > 0 then
-    return joinDisplayList(detail.potionEffects, 2)
-  end
-
-  if detail.lore and #detail.lore > 0 then
-    return tostring(detail.lore[1])
-  end
-
-  local ns = namespaceOf(detail.name or "")
-  if ns ~= "minecraft" then
-    return "[" .. prettyModName(ns) .. "]"
-  end
-
-  return ""
-end
-
-local function entryLabel(entry)
-  if entry.desc and entry.desc ~= "" then
-    return entry.displayName .. " - " .. entry.desc
-  end
-
-  return entry.displayName
-end
-
-local function entryKey(item)
-  return tostring(item.name) .. "#" .. tostring(item.nbt or "")
-end
-
-local function buildConfiguredTargets()
-  local pinned = {}
-  local overflowName = nil
-
-  for key, invName in pairs(SPECIAL_TARGETS) do
-    if invName and invName ~= "" and isInventory(invName) then
-      if key == "overflow" then
-        overflowName = invName
-      elseif GROUP_LABELS[key] then
-        pinned["group:" .. key] = invName
-      end
-    end
-  end
-
-  return pinned, overflowName
-end
-
-local function isMarkerSlot(invName, slot)
-  return slot == ROLE_MARKER_SLOT and state.markers[invName] ~= nil
-end
-
-local function chooseSourceRole(name, marker)
-  if not hasAnyType(name, SOURCE_CHEST_TYPES) then
-    return false
-  end
-
-  if marker and (marker.kind == "route" or marker.kind == "overflow") then
-    return false
-  end
-
-  return true
-end
-
-local function refreshTopology()
-  local configuredPinned, configuredOverflow = buildConfiguredTargets()
-  local markers = {}
-  local ignored = {}
-  local candidates = {}
-  local sourceNames = {}
-  local storageNames = {}
-  local markerRouteOwner = {}
-  local overflowMarkerOwner = nil
-
-  for _, name in ipairs(sortedNames()) do
-    if isInventory(name) then
-      local inv = peripheral.wrap(name)
-      local info = {
-        name = name,
-        size = invSize(inv),
-        types = listPeripheralTypes(name),
-      }
-
-      local marker = readInventoryMarker(name)
-      if marker then
-        markers[name] = marker
-        info.marker = marker
-
-        if marker.kind == "ignore" then
-          ignored[name] = true
-        elseif marker.kind == "overflow" then
-          if not overflowMarkerOwner then
-            configuredOverflow = name
-            overflowMarkerOwner = name
-          else
-            info.note = "zweiter Overflow-Marker ignoriert"
-          end
-        elseif marker.kind == "route" then
-          if not markerRouteOwner[marker.routeKey] then
-            configuredPinned[marker.routeKey] = name
-            markerRouteOwner[marker.routeKey] = name
-          else
-            info.note = "zweiter Gruppen-/Mod-Marker ignoriert"
-          end
-        elseif marker.kind == "io" then
-          info.note = "IO-Marker hat in diesem Skript keine Funktion"
-        end
-      end
-
-      candidates[#candidates + 1] = info
-    end
-  end
-
-  state.monitor = getMonitor()
-  if state.monitor then
-    state.monitor.setTextScale(MONITOR_SCALE)
-    state.monitor.setBackgroundColor(colors.black)
-    state.monitor.setTextColor(colors.white)
-  end
-
-  state.markers = markers
-  state.ignoredNames = ignored
-  state.pinnedTargets = configuredPinned
-  state.overflowName = configuredOverflow
-
-  for _, info in ipairs(candidates) do
-    local name = info.name
-    local marker = state.markers[name]
-
-    if state.ignoredNames[name] then
-      info.role = "Ignoriert"
-    elseif chooseSourceRole(name, marker) then
-      sourceNames[#sourceNames + 1] = name
-      info.role = "Quelle (Minecraft-Kiste)"
-    else
-      storageNames[#storageNames + 1] = name
-      info.role = "Lager"
-    end
-  end
-
-  table.sort(sourceNames)
-  table.sort(storageNames)
-  state.sourceNames = uniqueList(sourceNames)
-  state.storageNames = uniqueList(storageNames)
-
-  if #state.storageNames == 0 then
-    error("Keine Ziel-Inventare gefunden.\nMarkiere fremde Inventare mit LAGER:IGNORE oder haenge modded Lagerkisten an.", 0)
-  end
-
-  local validStorage = {}
-  local used = {}
-  for _, name in ipairs(state.storageNames) do
-    validStorage[name] = true
-  end
-
-  local cleanMap = {}
-  for routeKey, invName in pairs(state.pinnedTargets) do
-    if invName and validStorage[invName] then
-      cleanMap[routeKey] = invName
-      used[invName] = true
-    end
-  end
-
-  if state.overflowName and validStorage[state.overflowName] then
-    used[state.overflowName] = true
-  else
-    state.overflowName = nil
-  end
-
-  for key, invName in pairs(state.modMap) do
-    local routeKey = normalizeRouteKey(key)
-    if routeKey
-      and routeKey ~= "overflow"
-      and not cleanMap[routeKey]
-      and validStorage[invName]
-      and not used[invName]
-    then
-      cleanMap[routeKey] = invName
-      used[invName] = true
-    end
-  end
-
-  state.modMap = cleanMap
-  state.freePool = {}
-  state.poolNames = {}
-
-  for _, name in ipairs(state.storageNames) do
-    if not used[name] then
-      state.freePool[#state.freePool + 1] = name
-      state.poolNames[#state.poolNames + 1] = name
-    end
-  end
-
-  local pinnedByInv = {}
-  for routeKey, invName in pairs(state.pinnedTargets) do
-    if invName then
-      pinnedByInv[invName] = routeKey
-    end
-  end
-
-  for _, info in ipairs(candidates) do
-    if info.role ~= "Quelle (Minecraft-Kiste)" and info.role ~= "Ignoriert" then
-      if state.overflowName and info.name == state.overflowName then
-        info.role = "Overflow"
-      elseif pinnedByInv[info.name] then
-        info.role = routeLabel(pinnedByInv[info.name])
-      elseif validStorage[info.name] then
-        info.role = "Lager"
-      else
-        info.role = "-"
-      end
-    end
-  end
-
-  state.candidateInventories = candidates
-  saveMap()
-  state.topologySig = inventorySignature()
-  state.markerSig = markerSignature()
-  state.lastTopologyCheck = nowMs()
-  state.dirty = true
-end
-
-local function ensureTopology(force)
-  local now = nowMs()
-
-  if not force and state.lastTopologyCheck > 0 and (now - state.lastTopologyCheck) < (TOPOLOGY_REFRESH_INTERVAL * 1000) then
-    return false
-  end
-
-  state.lastTopologyCheck = now
-
-  local sig = inventorySignature()
-  local markerSig = markerSignature()
-  if force or sig ~= state.topologySig or markerSig ~= state.markerSig then
-    refreshTopology()
-    return true
-  end
-
-  return false
-end
-
-local function ensureRouteTarget(routeKey)
-  if routeKey == "overflow" then
-    return state.overflowName
-  end
-
-  local current = state.modMap[routeKey]
-  if current and isInventory(current) then
-    return current
-  end
-
-  local nextFree = table.remove(state.freePool, 1)
-  if nextFree then
-    state.modMap[routeKey] = nextFree
-    saveMap()
-    return nextFree
-  end
-
-  if state.overflowName and isInventory(state.overflowName) then
-    return state.overflowName
-  end
-
-  return nil
-end
-
-local function chooseTargetForItem(item)
-  local routeKey = routeKeyForItemName(item.name)
-  return ensureRouteTarget(routeKey), routeKey
-end
-
-local function scanStorage()
-  local index = {}
-  local order = {}
-  local totalItems = 0
-  local totalStacks = 0
-
-  for _, invName in ipairs(state.storageNames) do
-    local inv = peripheral.wrap(invName)
-    if inv then
-      for slot, item in pairs(invList(inv)) do
-        if not isMarkerSlot(invName, slot) then
-          totalStacks = totalStacks + 1
-          totalItems = totalItems + item.count
-
-          local key = entryKey(item)
-          local entry = index[key]
-          if not entry then
-            local detail = invDetail(inv, slot)
-            entry = {
-              key = key,
-              name = item.name,
-              nbt = item.nbt,
-              displayName = (detail and detail.displayName) or item.name,
-              desc = buildDescription(detail),
-              count = 0,
-              locs = {},
-            }
-            index[key] = entry
-            order[#order + 1] = entry
-          end
-
-          entry.count = entry.count + item.count
-          entry.locs[#entry.locs + 1] = {
-            inv = invName,
-            slot = slot,
-            count = item.count,
-          }
-        end
-      end
-    end
-  end
-
-  table.sort(order, function(a, b)
-    local ad = a.displayName:lower()
-    local bd = b.displayName:lower()
-
-    if ad == bd then
-      local aDesc = tostring(a.desc or ""):lower()
-      local bDesc = tostring(b.desc or ""):lower()
-
-      if aDesc == bDesc then
-        return a.name < b.name
-      end
-
-      return aDesc < bDesc
-    end
-
-    return ad < bd
+    return tostring(a.displayName) < tostring(b.displayName)
   end)
 
-  state.index = index
-  state.order = order
-  state.totalItems = totalItems
-  state.totalStacks = totalStacks
+  return out
 end
 
-local function scanSources()
-  local pendingItems = 0
-  local pendingStacks = 0
+local function sortModMap(map)
+  local out = {}
+  for mod, count in pairs(map or {}) do
+    out[#out + 1] = {
+      mod = mod,
+      label = prettyModName(mod),
+      count = count,
+    }
+  end
 
-  for _, invName in ipairs(state.sourceNames) do
-    local inv = peripheral.wrap(invName)
-    if inv then
-      for slot, item in pairs(invList(inv)) do
-        if not isMarkerSlot(invName, slot) then
-          pendingStacks = pendingStacks + 1
-          pendingItems = pendingItems + item.count
+  table.sort(out, function(a, b)
+    if a.count ~= b.count then
+      return a.count > b.count
+    end
+    return tostring(a.label) < tostring(b.label)
+  end)
+
+  return out
+end
+
+local function buildLocalStats()
+  local stats = {
+    inventoryCount = 0,
+    totalSlots = 0,
+    usedSlots = 0,
+    freeSlots = 0,
+    totalItems = 0,
+    inventories = {},
+    byKey = {},
+    modCounts = {},
+  }
+
+  for _, name in ipairs(sortedNames()) do
+    if hasType(name, "inventory") then
+      local inv = safeWrap(name)
+      if inv and not isIgnoredInventory(name, inv) then
+        local size = tonumber(safeCall(inv, "size")) or 0
+        local list = safeCall(inv, "list") or {}
+        local used = 0
+        local items = 0
+
+        for slot, item in pairs(list) do
+          if item and item.name and item.count then
+            local detail = safeCall(inv, "getItemDetail", slot) or item
+            if not (slot == ROLE_MARKER_SLOT and parseMarker(detail)) then
+              local count = tonumber(item.count) or 0
+              used = used + 1
+              items = items + count
+              stats.totalItems = stats.totalItems + count
+
+              mergeItem(stats.byKey, detail, "local", count)
+              local ns = namespaceOf(detail.name)
+              stats.modCounts[ns] = (stats.modCounts[ns] or 0) + count
+            end
+          end
+        end
+
+        stats.inventoryCount = stats.inventoryCount + 1
+        stats.totalSlots = stats.totalSlots + size
+        stats.usedSlots = stats.usedSlots + used
+        stats.freeSlots = stats.freeSlots + math.max(0, size - used)
+
+        stats.inventories[#stats.inventories + 1] = {
+          name = name,
+          types = joinList(listPeripheralTypes(name), "/"),
+          size = size,
+          usedSlots = used,
+          freeSlots = math.max(0, size - used),
+          totalItems = items,
+        }
+      end
+    end
+  end
+
+  table.sort(stats.inventories, function(a, b)
+    if a.totalItems ~= b.totalItems then
+      return a.totalItems > b.totalItems
+    end
+    if a.usedSlots ~= b.usedSlots then
+      return a.usedSlots > b.usedSlots
+    end
+    return tostring(a.name) < tostring(b.name)
+  end)
+
+  stats.order = sortItemMap(stats.byKey)
+  stats.uniqueItems = #stats.order
+  stats.modOrder = sortModMap(stats.modCounts)
+  return stats
+end
+
+local function buildMeStats()
+  local name = resolveMeBridgeName()
+  if not name then
+    return {
+      available = false,
+      name = nil,
+      byKey = {},
+      order = {},
+      craftables = {},
+      fluids = {},
+      modCounts = {},
+      craftableCount = 0,
+      fluidCount = 0,
+      cellCount = 0,
+      cpuCount = 0,
+      totalItems = 0,
+      uniqueItems = 0,
+    }
+  end
+
+  local bridge = safeWrap(name)
+  if not bridge then
+    return {
+      available = false,
+      name = name,
+      error = "ME Bridge konnte nicht geoeffnet werden",
+      byKey = {},
+      order = {},
+      craftables = {},
+      fluids = {},
+      modCounts = {},
+      craftableCount = 0,
+      fluidCount = 0,
+      cellCount = 0,
+      cpuCount = 0,
+      totalItems = 0,
+      uniqueItems = 0,
+    }
+  end
+
+  local stats = {
+    available = true,
+    name = name,
+    byKey = {},
+    modCounts = {},
+    craftables = {},
+    fluids = {},
+    cells = {},
+    cpus = {},
+    totalItems = 0,
+    uniqueItems = 0,
+    craftableCount = 0,
+    fluidCount = 0,
+    fluidTotal = 0,
+    cellCount = 0,
+    cpuCount = 0,
+    totalItemStorage = safeNumber(safeCall(bridge, "getTotalItemStorage")),
+    usedItemStorage = safeNumber(safeCall(bridge, "getUsedItemStorage")),
+    availableItemStorage = safeNumber(safeCall(bridge, "getAvailableItemStorage")),
+    totalFluidStorage = safeNumber(safeCall(bridge, "getTotalFluidStorage")),
+    usedFluidStorage = safeNumber(safeCall(bridge, "getUsedFluidStorage")),
+    availableFluidStorage = safeNumber(safeCall(bridge, "getAvailableFluidStorage")),
+    energyStorage = safeNumber(safeCall(bridge, "getEnergyStorage")),
+    maxEnergyStorage = safeNumber(safeCall(bridge, "getMaxEnergyStorage")),
+    energyUsage = safeNumber(safeCall(bridge, "getEnergyUsage")),
+  }
+
+  local items = safeCall(bridge, "listItems") or {}
+  for _, item in pairs(items) do
+    if item and item.name then
+      local count = tonumber(item.amount or item.count or 0) or 0
+      stats.totalItems = stats.totalItems + count
+      mergeItem(stats.byKey, item, "me", count)
+      local ns = namespaceOf(item.name)
+      stats.modCounts[ns] = (stats.modCounts[ns] or 0) + count
+    end
+  end
+
+  local craftables = safeCall(bridge, "listCraftableItems") or {}
+  for _, item in pairs(craftables) do
+    if item and item.name then
+      stats.craftables[#stats.craftables + 1] = {
+        name = item.name,
+        displayName = item.displayName or baseNameOf(item.name),
+      }
+    end
+  end
+
+  table.sort(stats.craftables, function(a, b)
+    return tostring(a.displayName) < tostring(b.displayName)
+  end)
+
+  local fluids = safeCall(bridge, "listFluid") or {}
+  for _, fluid in pairs(fluids) do
+    if fluid and fluid.name then
+      local amount = tonumber(fluid.amount or fluid.count or 0) or 0
+      stats.fluidTotal = stats.fluidTotal + amount
+      stats.fluids[#stats.fluids + 1] = {
+        name = fluid.name,
+        displayName = fluid.displayName or baseNameOf(fluid.name),
+        amount = amount,
+      }
+    end
+  end
+
+  table.sort(stats.fluids, function(a, b)
+    if a.amount ~= b.amount then
+      return a.amount > b.amount
+    end
+    return tostring(a.displayName) < tostring(b.displayName)
+  end)
+
+  stats.cells = safeCall(bridge, "listCells") or {}
+  stats.cpus = safeCall(bridge, "getCraftingCPUs") or {}
+
+  stats.order = sortItemMap(stats.byKey)
+  stats.uniqueItems = #stats.order
+  stats.modOrder = sortModMap(stats.modCounts)
+  stats.craftableCount = #stats.craftables
+  stats.fluidCount = #stats.fluids
+  stats.cellCount = 0
+  for _ in pairs(stats.cells) do
+    stats.cellCount = stats.cellCount + 1
+  end
+  stats.cpuCount = 0
+  for _ in pairs(stats.cpus) do
+    stats.cpuCount = stats.cpuCount + 1
+  end
+
+  return stats
+end
+
+local function buildCombinedStats(localStats, meStats)
+  local combined = {
+    byKey = {},
+    modCounts = {},
+    totalItems = 0,
+    uniqueItems = 0,
+  }
+
+  local function mergeExistingEntry(sourceEntry)
+    if not sourceEntry or not sourceEntry.key then
+      return
+    end
+
+    local entry = combined.byKey[sourceEntry.key]
+    if not entry then
+      entry = {
+        key = sourceEntry.key,
+        name = sourceEntry.name,
+        displayName = sourceEntry.displayName,
+        mod = sourceEntry.mod,
+        localCount = 0,
+        meCount = 0,
+        totalCount = 0,
+      }
+      combined.byKey[sourceEntry.key] = entry
+    end
+
+    entry.localCount = entry.localCount + (sourceEntry.localCount or 0)
+    entry.meCount = entry.meCount + (sourceEntry.meCount or 0)
+    entry.totalCount = entry.localCount + entry.meCount
+  end
+
+  for _, entry in ipairs(localStats.order or {}) do
+    mergeExistingEntry(entry)
+  end
+
+  for _, entry in ipairs(meStats.order or {}) do
+    mergeExistingEntry(entry)
+  end
+
+  for mod, count in pairs(localStats.modCounts or {}) do
+    combined.modCounts[mod] = (combined.modCounts[mod] or 0) + count
+  end
+  for mod, count in pairs(meStats.modCounts or {}) do
+    combined.modCounts[mod] = (combined.modCounts[mod] or 0) + count
+  end
+
+  combined.order = sortItemMap(combined.byKey)
+  combined.uniqueItems = #combined.order
+  combined.totalItems = (localStats.totalItems or 0) + (meStats.totalItems or 0)
+  combined.modOrder = sortModMap(combined.modCounts)
+  return combined
+end
+
+local function buildEnergyStats(meStats)
+  local stats = {
+    sources = {},
+    totalStored = 0,
+    totalCapacity = 0,
+    totalRate = 0,
+    totalUsage = 0,
+  }
+
+  for _, name in ipairs(sortedNames()) do
+    if not meStats.name or name ~= meStats.name then
+      local obj = safeWrap(name)
+      if obj then
+        local stored = firstNumericCall(obj, { "getEnergyStorage", "getEnergyStored", "getEnergy" })
+        local capacity = firstNumericCall(obj, { "getMaxEnergyStorage", "getMaxEnergyStored", "getEnergyCapacity" })
+        local rate = firstNumericCall(obj, { "getTransferRate", "getEnergyTransferRate", "getFlow", "getEnergyIn" })
+        local usage = firstNumericCall(obj, { "getEnergyUsage", "getConsumption", "getPowerUsage" })
+
+        if stored ~= nil or capacity ~= nil or rate ~= nil or usage ~= nil then
+          stats.sources[#stats.sources + 1] = {
+            name = name,
+            types = joinList(listPeripheralTypes(name), "/"),
+            stored = stored,
+            capacity = capacity,
+            rate = rate,
+            usage = usage,
+          }
+          stats.totalStored = stats.totalStored + (stored or 0)
+          stats.totalCapacity = stats.totalCapacity + (capacity or 0)
+          stats.totalRate = stats.totalRate + (rate or 0)
+          stats.totalUsage = stats.totalUsage + (usage or 0)
         end
       end
     end
   end
 
-  state.pendingSourceItems = pendingItems
-  state.pendingSourceStacks = pendingStacks
+  if meStats.available and (meStats.energyStorage ~= nil or meStats.maxEnergyStorage ~= nil or meStats.energyUsage ~= nil) then
+    stats.sources[#stats.sources + 1] = {
+      name = meStats.name .. " (ME)",
+      types = "meBridge",
+      stored = meStats.energyStorage,
+      capacity = meStats.maxEnergyStorage,
+      rate = nil,
+      usage = meStats.energyUsage,
+    }
+    stats.totalStored = stats.totalStored + (meStats.energyStorage or 0)
+    stats.totalCapacity = stats.totalCapacity + (meStats.maxEnergyStorage or 0)
+    stats.totalUsage = stats.totalUsage + (meStats.energyUsage or 0)
+  end
+
+  table.sort(stats.sources, function(a, b)
+    local aKey = math.abs(a.rate or 0)
+    local bKey = math.abs(b.rate or 0)
+    if aKey ~= bKey then
+      return aKey > bKey
+    end
+    local aStored = a.stored or 0
+    local bStored = b.stored or 0
+    if aStored ~= bStored then
+      return aStored > bStored
+    end
+    return tostring(a.name) < tostring(b.name)
+  end)
+
+  return stats
 end
 
-local function ensureFresh(force)
-  local topologyChanged = ensureTopology(force)
+local function buildPeripheralSummary()
+  local summary = {
+    total = 0,
+    inventory = 0,
+    monitor = 0,
+    meBridge = 0,
+    modem = 0,
+    speaker = 0,
+    energy = 0,
+    list = {},
+  }
 
-  if force or topologyChanged or state.dirty or (nowMs() - state.lastScan) >= (SCAN_INTERVAL * 1000) then
-    scanStorage()
-    scanSources()
-    state.lastScan = nowMs()
-    state.dirty = false
+  for _, name in ipairs(sortedNames()) do
+    local types = listPeripheralTypes(name)
+    local joined = joinList(types, "/")
+    summary.total = summary.total + 1
+    if hasType(name, "inventory") then
+      summary.inventory = summary.inventory + 1
+    end
+    if hasType(name, "monitor") then
+      summary.monitor = summary.monitor + 1
+    end
+    if hasType(name, "meBridge") then
+      summary.meBridge = summary.meBridge + 1
+    end
+    if hasType(name, "modem") then
+      summary.modem = summary.modem + 1
+    end
+    if hasType(name, "speaker") then
+      summary.speaker = summary.speaker + 1
+    end
+
+    local obj = safeWrap(name)
+    if obj then
+      if firstNumericCall(obj, { "getTransferRate", "getEnergyStorage", "getEnergyStored", "getEnergy", "getEnergyUsage" }) ~= nil then
+        summary.energy = summary.energy + 1
+      end
+    end
+
+    summary.list[#summary.list + 1] = {
+      name = name,
+      types = joined,
+    }
+  end
+
+  return summary
+end
+
+local function buildChanges(previous, current)
+  local prevMap = previous and previous.combined and previous.combined.byKey or {}
+  local currMap = current and current.combined and current.combined.byKey or {}
+  local keys = {}
+  local changes = {}
+
+  for key in pairs(prevMap or {}) do
+    keys[key] = true
+  end
+  for key in pairs(currMap or {}) do
+    keys[key] = true
+  end
+
+  for key in pairs(keys) do
+    local before = prevMap[key] and prevMap[key].totalCount or 0
+    local after = currMap[key] and currMap[key].totalCount or 0
+    if before ~= after then
+      local ref = currMap[key] or prevMap[key]
+      changes[#changes + 1] = {
+        key = key,
+        name = ref.name,
+        displayName = ref.displayName,
+        delta = after - before,
+        before = before,
+        after = after,
+      }
+    end
+  end
+
+  table.sort(changes, function(a, b)
+    local ad = math.abs(a.delta)
+    local bd = math.abs(b.delta)
+    if ad ~= bd then
+      return ad > bd
+    end
+    return tostring(a.displayName) < tostring(b.displayName)
+  end)
+
+  return changes
+end
+
+local function scanAll(silent)
+  local previous = state.snapshot
+  local snapshot = {
+    time = nowMs(),
+    monitorName = resolveMonitorName(),
+    meBridgeName = resolveMeBridgeName(),
+  }
+
+  snapshot.localStats = buildLocalStats()
+  snapshot.me = buildMeStats()
+  snapshot.combined = buildCombinedStats(snapshot.localStats, snapshot.me)
+  snapshot.energy = buildEnergyStats(snapshot.me)
+  snapshot.peripherals = buildPeripheralSummary()
+  snapshot.changes = buildChanges(previous, snapshot)
+
+  state.previous = previous
+  state.snapshot = snapshot
+  state.lastScan = snapshot.time
+
+  if not silent then
+    print("Scan fertig: " .. formatCount(snapshot.combined.totalItems) .. " Items gesamt, " .. formatCount(snapshot.combined.uniqueItems) .. " verschiedene Typen.")
   end
 end
 
-local function pushItemsSafe(fromInv, targetName, fromSlot, amount, toSlot)
-  if not fromInv or not targetName or not isInventory(targetName) then
-    return 0
+local function currentMonitor()
+  local name = state.snapshot and state.snapshot.monitorName or resolveMonitorName()
+  if not name then
+    return nil, nil
   end
 
-  local ok, sent
-  if toSlot then
-    ok, sent = pcall(fromInv.pushItems, targetName, fromSlot, amount, toSlot)
+  return safeWrap(name), name
+end
+
+local function addPage(pages, title, lines)
+  pages[#pages + 1] = {
+    title = title,
+    lines = lines,
+  }
+end
+
+local function buildMonitorPages(snapshot)
+  local pages = {}
+  if not snapshot then
+    addPage(pages, "Warten", {
+      "Noch kein Scan vorhanden.",
+      "Bitte 'scan' ausfuehren.",
+    })
+    return pages
+  end
+
+  local localStats = snapshot.localStats
+  local meStats = snapshot.me
+  local combined = snapshot.combined
+  local energy = snapshot.energy
+
+  addPage(pages, "Uebersicht", {
+    "Lokale Inventare: " .. formatCount(localStats.inventoryCount),
+    "Lokale Slots: " .. formatCount(localStats.usedSlots) .. "/" .. formatCount(localStats.totalSlots) .. " (" .. formatPercent(localStats.usedSlots, localStats.totalSlots) .. ")",
+    "Lokale Items: " .. formatCount(localStats.totalItems),
+    "Lokale Typen: " .. formatCount(localStats.uniqueItems),
+    "ME Bridge: " .. (meStats.available and meStats.name or "nicht gefunden"),
+    "ME Items: " .. formatCount(meStats.totalItems),
+    "ME Typen: " .. formatCount(meStats.uniqueItems),
+    "ME craftbar: " .. formatCount(meStats.craftableCount),
+    "Kombi Items: " .. formatCount(combined.totalItems),
+    "Kombi Typen: " .. formatCount(combined.uniqueItems),
+    "Energie-Quellen: " .. formatCount(#energy.sources),
+    "Letzter Scan: " .. formatSince(snapshot.time),
+  })
+
+  local topItemLines = {}
+  if #combined.order == 0 then
+    topItemLines[#topItemLines + 1] = "Keine Items gefunden."
   else
-    ok, sent = pcall(fromInv.pushItems, targetName, fromSlot, amount)
+    for i = 1, math.min(MAX_MONITOR_LINES, #combined.order) do
+      local entry = combined.order[i]
+      local top = tostring(i) .. ". " .. entry.displayName .. " " .. formatCount(entry.totalCount)
+      if entry.localCount > 0 and entry.meCount > 0 then
+        top = top .. " [L " .. formatCount(entry.localCount) .. " | ME " .. formatCount(entry.meCount) .. "]"
+      elseif entry.localCount > 0 then
+        top = top .. " [L]"
+      elseif entry.meCount > 0 then
+        top = top .. " [ME]"
+      end
+      topItemLines[#topItemLines + 1] = top
+    end
   end
+  addPage(pages, "Top Items", topItemLines)
 
-  if ok and sent and sent > 0 then
-    return sent
+  local modLines = {}
+  if #combined.modOrder == 0 then
+    modLines[#modLines + 1] = "Keine Mods gefunden."
+  else
+    for i = 1, math.min(MAX_MONITOR_LINES, #combined.modOrder) do
+      local entry = combined.modOrder[i]
+      modLines[#modLines + 1] = tostring(i) .. ". " .. entry.label .. " " .. formatCount(entry.count)
+    end
   end
+  addPage(pages, "Mods", modLines)
 
-  return 0
+  local invLines = {}
+  if #localStats.inventories == 0 then
+    invLines[#invLines + 1] = "Keine lokalen Inventare."
+  else
+    for i = 1, math.min(MAX_MONITOR_LINES, #localStats.inventories) do
+      local inv = localStats.inventories[i]
+      invLines[#invLines + 1] = tostring(i) .. ". " .. inv.name
+      invLines[#invLines + 1] = "   " .. formatCount(inv.totalItems) .. " Items | " .. formatCount(inv.usedSlots) .. "/" .. formatCount(inv.size) .. " Slots"
+    end
+  end
+  addPage(pages, "Inventare", invLines)
+
+  local meLines = {}
+  if not meStats.available then
+    meLines[#meLines + 1] = "Keine ME Bridge gefunden."
+  else
+    meLines[#meLines + 1] = "Bridge: " .. meStats.name
+    meLines[#meLines + 1] = "Item-Speicher: " .. formatMaybeCount(meStats.usedItemStorage) .. "/" .. formatMaybeCount(meStats.totalItemStorage)
+    meLines[#meLines + 1] = "Fluid-Speicher: " .. formatMaybeCount(meStats.usedFluidStorage) .. "/" .. formatMaybeCount(meStats.totalFluidStorage)
+    meLines[#meLines + 1] = "ME Energie: " .. formatEnergy(meStats.energyStorage, meStats.maxEnergyStorage)
+    meLines[#meLines + 1] = "ME Verbrauch: " .. formatRate(meStats.energyUsage)
+    meLines[#meLines + 1] = "Craftbar: " .. formatCount(meStats.craftableCount)
+    meLines[#meLines + 1] = "Fluids: " .. formatCount(meStats.fluidCount) .. " Typen"
+    meLines[#meLines + 1] = "Zellen: " .. formatCount(meStats.cellCount)
+    meLines[#meLines + 1] = "CPUs: " .. formatCount(meStats.cpuCount)
+
+    local shown = 0
+    for i = 1, math.min(6, #meStats.fluids) do
+      local fluid = meStats.fluids[i]
+      meLines[#meLines + 1] = "F " .. fluid.displayName .. " " .. formatCount(fluid.amount)
+      shown = shown + 1
+    end
+    if shown == 0 then
+      meLines[#meLines + 1] = "Keine Fluids in der ME erkannt."
+    end
+  end
+  addPage(pages, "ME System", meLines)
+
+  local energyLines = {}
+  if #energy.sources == 0 then
+    energyLines[#energyLines + 1] = "Keine Stromdaten gefunden."
+    energyLines[#energyLines + 1] = "Tipp: Energy Detector oder"
+    energyLines[#energyLines + 1] = "ME Bridge anschliessen."
+  else
+    energyLines[#energyLines + 1] = "Gespeichert: " .. formatEnergy(energy.totalStored, energy.totalCapacity)
+    energyLines[#energyLines + 1] = "Transfer: " .. formatRate(energy.totalRate)
+    energyLines[#energyLines + 1] = "Verbrauch: " .. formatRate(energy.totalUsage)
+    for i = 1, math.min(MAX_MONITOR_LINES - 3, #energy.sources) do
+      local src = energy.sources[i]
+      local line = src.name .. " "
+      if src.rate ~= nil then
+        line = line .. formatRate(src.rate)
+      elseif src.usage ~= nil then
+        line = line .. "Use " .. formatRate(src.usage)
+      else
+        line = line .. formatEnergy(src.stored, src.capacity)
+      end
+      energyLines[#energyLines + 1] = line
+    end
+  end
+  addPage(pages, "Strom", energyLines)
+
+  local changeLines = {}
+  if #snapshot.changes == 0 then
+    changeLines[#changeLines + 1] = "Seit dem letzten Scan keine"
+    changeLines[#changeLines + 1] = "Aenderungen erkannt."
+  else
+    for i = 1, math.min(MAX_MONITOR_LINES, #snapshot.changes) do
+      local entry = snapshot.changes[i]
+      local prefix = entry.delta > 0 and "+" or ""
+      changeLines[#changeLines + 1] = tostring(i) .. ". " .. entry.displayName .. " " .. prefix .. formatCount(entry.delta)
+    end
+  end
+  addPage(pages, "Aenderungen", changeLines)
+
+  return pages
 end
 
-local function pushBetweenInventories(fromInvName, targetName, fromSlot, amount, toSlot)
-  if not fromInvName or not targetName or fromInvName == targetName then
-    return 0
+local function renderMonitor()
+  local monitor, name = currentMonitor()
+  if not monitor then
+    return
   end
 
-  if not isInventory(fromInvName) or not isInventory(targetName) then
-    return 0
+  local scale = tonumber(state.config.monitorScale) or DEFAULT_MONITOR_SCALE
+  pcall(monitor.setTextScale, scale)
+  pcall(monitor.setBackgroundColor, colors.black)
+  pcall(monitor.setTextColor, colors.white)
+  pcall(monitor.clear)
+  pcall(monitor.setCursorPos, 1, 1)
+
+  local width, height = monitor.getSize()
+  local pages = buildMonitorPages(state.snapshot)
+  if #pages == 0 then
+    return
   end
 
-  local fromInv = peripheral.wrap(fromInvName)
-  if not fromInv then
-    return 0
+  if state.page < 1 then
+    state.page = 1
+  end
+  if state.page > #pages then
+    state.page = 1
   end
 
-  local detail = invDetail(fromInv, fromSlot)
-  if not detail then
-    return 0
+  local page = pages[state.page]
+  local y = 1
+
+  local function monLine(text, color)
+    if y > height then
+      return
+    end
+    monitor.setCursorPos(1, y)
+    if color then
+      monitor.setTextColor(color)
+    else
+      monitor.setTextColor(colors.white)
+    end
+    monitor.write(clip(text, width))
+    y = y + 1
   end
 
-  return pushItemsSafe(fromInv, targetName, fromSlot, amount or detail.count, toSlot)
+  monLine("Lager Statistik - " .. page.title, colors.cyan)
+  monLine("Monitor: " .. name .. " | Seite " .. tostring(state.page) .. "/" .. tostring(#pages), colors.lightGray)
+
+  for _, line in ipairs(page.lines or {}) do
+    if y > height then
+      break
+    end
+    monLine(line, colors.white)
+  end
 end
 
-local function moveIntoAnyStorage(fromInvName, fromSlot, attemptedInventories)
-  local moved = 0
+local function printSection(title)
+  print("")
+  print("=== " .. title .. " ===")
+end
 
-  for _, invName in ipairs(state.storageNames) do
-    if invName ~= fromInvName and isInventory(invName) and not attemptedInventories[invName] then
-      attemptedInventories[invName] = true
-      moved = moved + pushBetweenInventories(fromInvName, invName, fromSlot)
+local function showStatus()
+  local snapshot = state.snapshot
+  if not snapshot then
+    print("Noch kein Scan vorhanden.")
+    return
+  end
 
-      if not invDetail(peripheral.wrap(fromInvName), fromSlot) then
+  printSection("Uebersicht")
+  print("Lokale Inventare: " .. formatCount(snapshot.localStats.inventoryCount))
+  print("Lokale Slots:     " .. formatCount(snapshot.localStats.usedSlots) .. "/" .. formatCount(snapshot.localStats.totalSlots) .. " (" .. formatPercent(snapshot.localStats.usedSlots, snapshot.localStats.totalSlots) .. ")")
+  print("Lokale Items:     " .. formatCount(snapshot.localStats.totalItems))
+  print("Lokale Typen:     " .. formatCount(snapshot.localStats.uniqueItems))
+  print("ME Bridge:        " .. (snapshot.me.available and snapshot.me.name or "nicht gefunden"))
+  print("ME Items:         " .. formatCount(snapshot.me.totalItems))
+  print("ME Typen:         " .. formatCount(snapshot.me.uniqueItems))
+  print("ME craftbar:      " .. formatCount(snapshot.me.craftableCount))
+  print("Kombi Items:      " .. formatCount(snapshot.combined.totalItems))
+  print("Kombi Typen:      " .. formatCount(snapshot.combined.uniqueItems))
+  print("Energie-Quellen:  " .. formatCount(#snapshot.energy.sources))
+  print("Letzter Scan:     " .. formatSince(snapshot.time))
+end
+
+local function showTop(limit)
+  local snapshot = state.snapshot
+  if not snapshot then
+    print("Noch kein Scan vorhanden.")
+    return
+  end
+
+  limit = math.max(1, math.floor(tonumber(limit) or 15))
+  printSection("Top Items")
+
+  if #snapshot.combined.order == 0 then
+    print("Keine Items gefunden.")
+    return
+  end
+
+  for i = 1, math.min(limit, #snapshot.combined.order) do
+    local entry = snapshot.combined.order[i]
+    local line = string.format("%2d) %s = %s", i, entry.displayName, formatCount(entry.totalCount))
+    if entry.localCount > 0 or entry.meCount > 0 then
+      line = line .. " | Lokal " .. formatCount(entry.localCount) .. " | ME " .. formatCount(entry.meCount)
+    end
+    print(line)
+  end
+end
+
+local function showMods(limit)
+  local snapshot = state.snapshot
+  if not snapshot then
+    print("Noch kein Scan vorhanden.")
+    return
+  end
+
+  limit = math.max(1, math.floor(tonumber(limit) or 15))
+  printSection("Mod Statistik")
+
+  if #snapshot.combined.modOrder == 0 then
+    print("Keine Mod-Daten gefunden.")
+    return
+  end
+
+  for i = 1, math.min(limit, #snapshot.combined.modOrder) do
+    local entry = snapshot.combined.modOrder[i]
+    print(string.format("%2d) %s = %s", i, entry.label, formatCount(entry.count)))
+  end
+end
+
+local function showInventories(limit)
+  local snapshot = state.snapshot
+  if not snapshot then
+    print("Noch kein Scan vorhanden.")
+    return
+  end
+
+  limit = math.max(1, math.floor(tonumber(limit) or 15))
+  printSection("Lokale Inventare")
+
+  if #snapshot.localStats.inventories == 0 then
+    print("Keine lokalen Inventare gefunden.")
+    return
+  end
+
+  for i = 1, math.min(limit, #snapshot.localStats.inventories) do
+    local inv = snapshot.localStats.inventories[i]
+    print(string.format("%2d) %s", i, inv.name))
+    print("    Typen:  " .. inv.types)
+    print("    Items:  " .. formatCount(inv.totalItems))
+    print("    Slots:  " .. formatCount(inv.usedSlots) .. "/" .. formatCount(inv.size) .. " (frei " .. formatCount(inv.freeSlots) .. ")")
+  end
+end
+
+local function showMe()
+  local snapshot = state.snapshot
+  if not snapshot then
+    print("Noch kein Scan vorhanden.")
+    return
+  end
+
+  printSection("ME System")
+  if not snapshot.me.available then
+    print("Keine ME Bridge gefunden.")
+    return
+  end
+
+  local me = snapshot.me
+  print("Bridge:           " .. me.name)
+  print("Items gesamt:     " .. formatCount(me.totalItems))
+  print("Item-Typen:       " .. formatCount(me.uniqueItems))
+  print("Craftbar:         " .. formatCount(me.craftableCount))
+  print("Fluids:           " .. formatCount(me.fluidCount) .. " Typen / " .. formatCount(me.fluidTotal) .. " Menge")
+  print("Item-Speicher:    " .. formatMaybeCount(me.usedItemStorage) .. "/" .. formatMaybeCount(me.totalItemStorage))
+  print("Fluid-Speicher:   " .. formatMaybeCount(me.usedFluidStorage) .. "/" .. formatMaybeCount(me.totalFluidStorage))
+  print("Energie:          " .. formatEnergy(me.energyStorage, me.maxEnergyStorage))
+  print("Verbrauch:        " .. formatRate(me.energyUsage))
+  print("Zellen:           " .. formatCount(me.cellCount))
+  print("CPUs:             " .. formatCount(me.cpuCount))
+end
+
+local function showFluids(limit)
+  local snapshot = state.snapshot
+  if not snapshot then
+    print("Noch kein Scan vorhanden.")
+    return
+  end
+
+  limit = math.max(1, math.floor(tonumber(limit) or 15))
+  printSection("ME Fluids")
+
+  if not snapshot.me.available then
+    print("Keine ME Bridge gefunden.")
+    return
+  end
+
+  if #snapshot.me.fluids == 0 then
+    print("Keine Fluids gefunden.")
+    return
+  end
+
+  for i = 1, math.min(limit, #snapshot.me.fluids) do
+    local fluid = snapshot.me.fluids[i]
+    print(string.format("%2d) %s = %s", i, fluid.displayName, formatCount(fluid.amount)))
+  end
+end
+
+local function showCraftables(limit)
+  local snapshot = state.snapshot
+  if not snapshot then
+    print("Noch kein Scan vorhanden.")
+    return
+  end
+
+  limit = math.max(1, math.floor(tonumber(limit) or 20))
+  printSection("ME Craftables")
+
+  if not snapshot.me.available then
+    print("Keine ME Bridge gefunden.")
+    return
+  end
+
+  if #snapshot.me.craftables == 0 then
+    print("Keine craftbaren Items gefunden.")
+    return
+  end
+
+  for i = 1, math.min(limit, #snapshot.me.craftables) do
+    local item = snapshot.me.craftables[i]
+    print(string.format("%2d) %s", i, item.displayName))
+  end
+end
+
+local function showEnergy()
+  local snapshot = state.snapshot
+  if not snapshot then
+    print("Noch kein Scan vorhanden.")
+    return
+  end
+
+  printSection("Strom")
+  if #snapshot.energy.sources == 0 then
+    print("Keine Stromquellen erkannt.")
+    print("Tipp: Energy Detector oder ME Bridge nutzen.")
+    return
+  end
+
+  print("Gespeichert: " .. formatEnergy(snapshot.energy.totalStored, snapshot.energy.totalCapacity))
+  print("Transfer:    " .. formatRate(snapshot.energy.totalRate))
+  print("Verbrauch:   " .. formatRate(snapshot.energy.totalUsage))
+  print("")
+
+  for i, src in ipairs(snapshot.energy.sources) do
+    print(string.format("%2d) %s", i, src.name))
+    print("    Typen:      " .. src.types)
+    print("    Gespeichert:" .. " " .. formatEnergy(src.stored, src.capacity))
+    print("    Transfer:   " .. formatRate(src.rate))
+    print("    Verbrauch:  " .. formatRate(src.usage))
+  end
+end
+
+local function showPeripherals()
+  local snapshot = state.snapshot
+  if not snapshot then
+    print("Noch kein Scan vorhanden.")
+    return
+  end
+
+  printSection("Peripherals")
+  print("Gesamt:     " .. formatCount(snapshot.peripherals.total))
+  print("Inventare:  " .. formatCount(snapshot.peripherals.inventory))
+  print("Monitore:   " .. formatCount(snapshot.peripherals.monitor))
+  print("ME Bridge:  " .. formatCount(snapshot.peripherals.meBridge))
+  print("Modems:     " .. formatCount(snapshot.peripherals.modem))
+  print("Speaker:    " .. formatCount(snapshot.peripherals.speaker))
+  print("Stromdaten: " .. formatCount(snapshot.peripherals.energy))
+  print("")
+
+  for i, entry in ipairs(snapshot.peripherals.list) do
+    print(string.format("%2d) %s [%s]", i, entry.name, entry.types))
+  end
+end
+
+local function showChanges(limit)
+  local snapshot = state.snapshot
+  if not snapshot then
+    print("Noch kein Scan vorhanden.")
+    return
+  end
+
+  limit = math.max(1, math.floor(tonumber(limit) or 15))
+  printSection("Aenderungen seit letztem Scan")
+
+  if #snapshot.changes == 0 then
+    print("Keine Aenderungen erkannt.")
+    return
+  end
+
+  for i = 1, math.min(limit, #snapshot.changes) do
+    local entry = snapshot.changes[i]
+    local prefix = entry.delta > 0 and "+" or ""
+    print(string.format("%2d) %s: %s%s (vorher %s, jetzt %s)", i, entry.displayName, prefix, formatCount(entry.delta), formatCount(entry.before), formatCount(entry.after)))
+  end
+end
+
+local function showFind(term)
+  local snapshot = state.snapshot
+  if not snapshot then
+    print("Noch kein Scan vorhanden.")
+    return
+  end
+
+  term = trim(term):lower()
+  if term == "" then
+    print("Bitte Suchbegriff angeben.")
+    return
+  end
+
+  printSection("Suche: " .. term)
+  local found = 0
+
+  for _, entry in ipairs(snapshot.combined.order) do
+    local hay = (entry.displayName .. " " .. entry.name):lower()
+    if hay:find(term, 1, true) then
+      found = found + 1
+      print(string.format("%2d) %s = %s | Lokal %s | ME %s", found, entry.displayName, formatCount(entry.totalCount), formatCount(entry.localCount), formatCount(entry.meCount)))
+      if found >= 20 then
         break
       end
     end
   end
 
-  return moved
-end
-
-local function moveSlotFromSource(fromInvName, fromSlot)
-  local fromInv = peripheral.wrap(fromInvName)
-  if not fromInv then
-    return 0
-  end
-
-  local detail = invDetail(fromInv, fromSlot)
-  if not detail or isMarkerSlot(fromInvName, fromSlot) then
-    return 0
-  end
-
-  local moved = 0
-  local attemptedInventories = {}
-
-  local targetName = select(1, chooseTargetForItem(detail))
-  if targetName and targetName ~= fromInvName then
-    attemptedInventories[targetName] = true
-    moved = moved + pushBetweenInventories(fromInvName, targetName, fromSlot, detail.count)
-  end
-
-  if invDetail(fromInv, fromSlot) then
-    moved = moved + moveIntoAnyStorage(fromInvName, fromSlot, attemptedInventories)
-  end
-
-  if invDetail(fromInv, fromSlot)
-    and state.overflowName
-    and state.overflowName ~= fromInvName
-    and not attemptedInventories[state.overflowName]
-  then
-    attemptedInventories[state.overflowName] = true
-    moved = moved + pushBetweenInventories(fromInvName, state.overflowName, fromSlot)
-  end
-
-  if moved > 0 then
-    state.dirty = true
-  end
-
-  return moved
-end
-
-local function lockMigration()
-  local h = fs.open(FINAL_LOCK_FILE, "w")
-  if h then
-    h.writeLine("Migration abgeschlossen")
-    h.writeLine(textutils.formatTime(os.time(), true))
-    h.close()
-  end
-  state.migrationLocked = true
-end
-
-local function loadMigrationLock()
-  state.migrationLocked = fs.exists(FINAL_LOCK_FILE)
-end
-
-local function finalMigrate()
-  ensureFresh(true)
-
-  if state.migrationLocked then
-    print("Migration ist bereits abgeschlossen und gesperrt.")
-    print("Nur Statistik-Modus aktiv.")
-    return
-  end
-
-  if #state.sourceNames == 0 then
-    print("Keine Standard-Minecraft-Kisten als Quelle gefunden.")
-    return
-  end
-
-  local movedStacks = 0
-  local movedItems = 0
-
-  print("Letzte Umlagerung startet...")
-
-  for _, invName in ipairs(state.sourceNames) do
-    local inv = peripheral.wrap(invName)
-    if inv then
-      for slot = 1, invSize(inv) do
-        if not isMarkerSlot(invName, slot) then
-          while true do
-            local before = invDetail(inv, slot)
-            if not before then
-              break
-            end
-
-            local sent = moveSlotFromSource(invName, slot)
-            if sent <= 0 then
-              break
-            end
-
-            movedStacks = movedStacks + 1
-            movedItems = movedItems + sent
-            sleep(0)
-          end
-        end
-      end
-    end
-  end
-
-  ensureFresh(true)
-
-  print(("Umlagerung fertig: %d Bewegungen / %s Items"):format(movedStacks, formatCount(movedItems)))
-
-  if state.pendingSourceItems == 0 then
-    lockMigration()
-    print("Alle Standard-Minecraft-Kisten sind leer.")
-    print("Ab jetzt ist nur noch Statistik-Modus aktiv.")
-  else
-    print(("Noch offen in Quellkisten: %s Items in %d Stacks"):format(formatCount(state.pendingSourceItems), state.pendingSourceStacks))
-    print("Es fehlt wahrscheinlich Platz im Ziel-Lager oder ein Inventar sollte mit LAGER:IGNORE markiert werden.")
+  if found == 0 then
+    print("Keine Treffer.")
   end
 end
 
-local function rememberShown(entries, query)
-  state.lastShownKeys = {}
-  state.lastShownQuery = tostring(query or "")
-
-  for i, entry in ipairs(entries or {}) do
-    state.lastShownKeys[i] = entry.key
-  end
+local function showMonitorStatus()
+  local name = resolveMonitorName()
+  printSection("Monitor")
+  print("Monitor:       " .. (name or "aus / keiner gefunden"))
+  print("Skalierung:    " .. tostring(state.config.monitorScale))
+  print("Scan Intervall:" .. " " .. tostring(state.config.scanInterval) .. "s")
+  print("Seitenwechsel: " .. tostring(state.config.pageInterval) .. "s")
 end
 
-local function findMatches(query)
-  ensureFresh(false)
-
-  local q = trim(query or ""):lower()
-  local hits = {}
-
-  if q == "" then
-    return hits
-  end
-
-  if q:sub(1, 1) == "@" then
-    local routeQuery = trim(q:sub(2))
-    for _, entry in ipairs(state.order) do
-      local routeKey = routeKeyForItemName(entry.name)
-      local routeName = routeLabel(routeKey):lower()
-      local ns = namespaceOf(entry.name):lower()
-
-      if routeKey == routeQuery
-        or routeKey == ("mod:" .. routeQuery)
-        or routeKey == ("group:" .. routeQuery)
-        or ns == routeQuery
-        or routeName:find(routeQuery, 1, true)
-        or routeKey:find(routeQuery, 1, true)
-      then
-        hits[#hits + 1] = entry
-      end
-    end
-
-    return hits
-  end
-
-  local exact = {}
-  local fuzzy = {}
-
-  for _, entry in ipairs(state.order) do
-    local name = entry.name:lower()
-    local display = entry.displayName:lower()
-    local desc = tostring(entry.desc or ""):lower()
-
-    if name == q or display == q or (q ~= "" and desc == q) then
-      exact[#exact + 1] = entry
-    end
-  end
-
-  if #exact > 0 then
-    return exact
-  end
-
-  for _, entry in ipairs(state.order) do
-    local name = entry.name:lower()
-    local display = entry.displayName:lower()
-    local desc = tostring(entry.desc or ""):lower()
-
-    if name:find(q, 1, true) or display:find(q, 1, true) or (q ~= "" and desc:find(q, 1, true)) then
-      fuzzy[#fuzzy + 1] = entry
-    end
-  end
-
-  return fuzzy
-end
-
-local function printEntries(entries, maxLines)
-  maxLines = maxLines or #entries
-
-  for i = 1, math.min(#entries, maxLines) do
-    local e = entries[i]
-    print(("%2d) %s x%s"):format(i, entryLabel(e), formatCount(e.count)))
-  end
-
-  if #entries > maxLines then
-    print(("... %d weitere Treffer"):format(#entries - maxLines))
-  end
-end
-
-local function buildGroupOverview()
-  local stats = {}
-
-  for _, entry in ipairs(state.order) do
-    local routeKey = routeKeyForItemName(entry.name)
-    local row = stats[routeKey]
-    if not row then
-      row = {
-        routeKey = routeKey,
-        types = 0,
-        items = 0,
-      }
-      stats[routeKey] = row
-    end
-
-    row.types = row.types + 1
-    row.items = row.items + entry.count
-  end
-
-  local rows = {}
-  for _, row in pairs(stats) do
-    rows[#rows + 1] = row
-  end
-
-  table.sort(rows, function(a, b)
-    if a.items == b.items then
-      return routeLabel(a.routeKey) < routeLabel(b.routeKey)
-    end
-
-    return a.items > b.items
-  end)
-
-  return rows
-end
-
-local function printGroupOverview(limit)
-  ensureFresh(false)
-
-  local rows = buildGroupOverview()
-  print(("Gruppen: %d | Typen: %d | Items: %s"):format(#rows, #state.order, formatCount(state.totalItems)))
-
-  limit = limit or #rows
-  for i = 1, math.min(#rows, limit) do
-    local row = rows[i]
-    print(("%2d) %s | %d Typen | %s Items"):format(i, routeLabel(row.routeKey), row.types, formatCount(row.items)))
-  end
-
-  if #rows > limit then
-    print(("... %d weitere Gruppen"):format(#rows - limit))
-  end
-end
-
-local function listItems(filter)
-  ensureFresh(false)
-  filter = trim(filter or "")
-
-  if filter == "" then
-    printGroupOverview(12)
-    print("")
-    print("Suche: list <suchwort>")
-    print("Nach Mod/Gruppe: list @create oder list @stone")
-    return
-  end
-
-  local hits = findMatches(filter)
-  if #hits == 0 then
-    print("Keine Treffer fuer: " .. tostring(filter))
-    return
-  end
-
-  rememberShown(hits, filter)
-  print(("Treffer fuer '%s': %d"):format(filter, #hits))
-  printEntries(hits, 20)
-end
-
-local function listAssignments()
-  ensureFresh(false)
-
-  print("Zuordnung:")
-
-  local rows = {}
-  for routeKey, invName in pairs(state.modMap) do
-    rows[#rows + 1] = {
-      routeKey = routeKey,
-      inv = invName,
-      pinned = state.pinnedTargets[routeKey] == invName,
-    }
-  end
-
-  table.sort(rows, function(a, b)
-    return routeLabel(a.routeKey) < routeLabel(b.routeKey)
-  end)
-
-  if #rows == 0 then
-    print(" noch keine")
-  else
-    for _, row in ipairs(rows) do
-      local prefix = row.pinned and " * " or "   "
-      print(prefix .. routeLabel(row.routeKey) .. " -> " .. tostring(row.inv))
-    end
-  end
-
-  if state.overflowName then
-    print("")
-    print("Overflow -> " .. tostring(state.overflowName))
-  end
-
+local function showHelp()
+  printSection("Statistik-Modus")
+  print("Dieses Script bewegt keine Items mehr.")
+  print("Es liest nur Lager-, ME- und Stromdaten aus.")
   print("")
-  print("Freie Auto-Ziele: " .. #state.poolNames)
-end
-
-local function listInventories()
-  ensureTopology(true)
-  ensureFresh(false)
-
-  print("Inventare:")
-  for _, info in ipairs(state.candidateInventories) do
-    print(("- %s | %d Slots | %s"):format(info.name, info.size or 0, info.role or "-"))
-
-    if info.marker then
-      print("  Marker: " .. tostring(info.marker.label or info.marker.routeKey or info.marker.kind))
-    end
-
-    if info.note then
-      print("  Hinweis: " .. info.note)
-    end
-
-    local types = joinList(info.types, ", ")
-    if types ~= "" then
-      print("  Typen: " .. types)
-    end
-  end
-
-  print("")
-  print("Marker in Slot " .. ROLE_MARKER_SLOT .. ":")
-  print(" LAGER:GROUP:stone")
-  print(" LAGER:MOD:create")
-  print(" LAGER:OVERFLOW")
-  print(" LAGER:IGNORE")
-end
-
-local function printStatus()
-  ensureFresh(false)
-
-  print("Modus: Statistik + letzte Umlagerung")
-  print("Monitor: " .. (state.monitor and "ja" or "nein"))
-  print("Ziel-Inventare: " .. tostring(#state.storageNames))
-  print("Quell-Minecraft-Kisten: " .. tostring(#state.sourceNames))
-  print("Ziel-Typen: " .. tostring(#state.order) .. " | Ziel-Items: " .. formatCount(state.totalItems))
-  print("Offen in Quellkisten: " .. formatCount(state.pendingSourceItems) .. " Items in " .. tostring(state.pendingSourceStacks) .. " Stacks")
-  print("Migration gesperrt: " .. (state.migrationLocked and "ja" or "nein"))
-end
-
-local function redrawMonitor(page)
-  local m = state.monitor
-  if not m then
-    return 1, 1
-  end
-
-  local w, h = m.getSize()
-  local headerLines = math.min(2, h)
-  local lines = math.max(1, h - headerLines)
-  local pages = math.max(1, math.ceil(#state.order / lines))
-
-  if page > pages then
-    page = 1
-  end
-
-  m.setBackgroundColor(colors.black)
-  m.clear()
-  m.setTextColor(colors.yellow)
-  m.setCursorPos(1, 1)
-  m.write(clip(("Lager %d/%d | %d Typen | %s Items"):format(page, pages, #state.order, formatCount(state.totalItems)), w))
-
-  if h >= 2 then
-    m.setCursorPos(1, 2)
-    if state.pendingSourceItems > 0 then
-      m.setTextColor(colors.orange)
-      m.write(clip(("Quellkisten offen: %s"):format(formatCount(state.pendingSourceItems)), w))
-    else
-      m.setTextColor(colors.lime)
-      local text = state.migrationLocked and "Migration abgeschlossen" or "Quellkisten leer"
-      m.write(clip(text, w))
-    end
-  end
-
-  local startIndex = (page - 1) * lines + 1
-  for row = 1, lines do
-    local entry = state.order[startIndex + row - 1]
-    local y = row + headerLines
-
-    if y > h then
-      break
-    end
-
-    if entry then
-      local countText = formatCount(entry.count)
-      local countWidth = #countText
-      local nameWidth = math.max(12, math.floor(w * 0.44))
-      local descWidth = math.max(0, w - nameWidth - countWidth - 3)
-
-      m.setTextColor(colors.white)
-      m.setCursorPos(1, y)
-      m.write(clip(entry.displayName, nameWidth))
-
-      if descWidth > 0 then
-        m.setTextColor(colors.lightGray)
-        m.setCursorPos(nameWidth + 2, y)
-        m.write(clip(entry.desc or "", descWidth))
-      end
-
-      m.setTextColor(colors.lime)
-      m.setCursorPos(w - countWidth + 1, y)
-      m.write(countText)
-    end
-  end
-
-  return page, pages
-end
-
-local function monitorLoop()
-  local page = 1
-
-  while true do
-    state.monitor = getMonitor()
-    if state.monitor then
-      state.monitor.setTextScale(MONITOR_SCALE)
-      state.monitor.setBackgroundColor(colors.black)
-      state.monitor.setTextColor(colors.white)
-    end
-
-    ensureFresh(false)
-
-    if state.monitor then
-      local currentPage, pageCount = redrawMonitor(page)
-      page = currentPage + 1
-      if page > pageCount then
-        page = 1
-      end
-    end
-
-    sleep(PAGE_INTERVAL)
-  end
-end
-
-local function printHelp()
   print("Befehle:")
-  print(" hilfe")
-  print(" status")
-  print(" inventare")
-  print(" zuordnung")
-  print(" gruppen")
-  print(" list [filter]")
-  print(" scan")
-  print(" umlagern")
-  print(" stop")
-  print("")
-  print("Dieses Skript zieht Standard-Minecraft-Kisten nur noch einmal leer.")
-  print("Danach bleibt nur Statistik/Monitor aktiv.")
+  print("  help / hilfe             - Hilfe anzeigen")
+  print("  scan                     - sofort neu scannen")
+  print("  status                   - Uebersicht")
+  print("  top [n]                  - groesste Itemstapel")
+  print("  mods [n]                 - Mod-Statistik")
+  print("  inv [n]                  - lokale Inventare")
+  print("  me                       - ME-Details")
+  print("  fluids [n]               - ME-Fluids")
+  print("  craft [n]                - craftbare ME-Items")
+  print("  energy / strom           - Stromdaten")
+  print("  find <text>              - Itemsuche lokal + ME")
+  print("  changes [n]              - Veraenderungen")
+  print("  periph                   - erkannte Peripherals")
+  print("  monitor                  - Monitorstatus")
+  print("  monitor off              - Monitor deaktivieren")
+  print("  monitor auto             - Monitor automatisch finden")
+  print("  monitor <name>           - festen Monitor setzen")
+  print("  monitor scale <wert>     - z.B. 0.5")
+  print("  mebridge off             - ME Bridge deaktivieren")
+  print("  mebridge auto            - ME Bridge automatisch finden")
+  print("  mebridge <name>          - feste ME Bridge setzen")
+  print("  intervall <scan> [page]  - Zeiten in Sekunden")
+  print("  seite <n|next|prev>      - Monitorseite manuell")
+  print("  exit                     - Script beenden")
+end
+
+local function handleMonitorCommand(args)
+  if not args[2] then
+    showMonitorStatus()
+    return
+  end
+
+  local sub = tostring(args[2]):lower()
+
+  if sub == "off" then
+    state.config.monitorDisabled = true
+    state.config.monitorName = nil
+    saveConfig()
+    scanAll(true)
+    print("Monitor deaktiviert.")
+    return
+  end
+
+  if sub == "auto" then
+    state.config.monitorDisabled = false
+    state.config.monitorName = nil
+    saveConfig()
+    scanAll(true)
+    renderMonitor()
+    print("Monitor wird jetzt automatisch gesucht.")
+    return
+  end
+
+  if sub == "scale" then
+    local value = tonumber(args[3] or "")
+    if not value then
+      print("Bitte gueltigen Zahlenwert angeben, z.B. 0.5")
+      return
+    end
+
+    state.config.monitorScale = value
+    saveConfig()
+    renderMonitor()
+    print("Monitor-Skalierung gesetzt auf " .. tostring(value))
+    return
+  end
+
+  local name = args[2]
+  if peripheral.isPresent(name) and hasType(name, "monitor") then
+    state.config.monitorDisabled = false
+    state.config.monitorName = name
+    saveConfig()
+    scanAll(true)
+    renderMonitor()
+    print("Monitor gesetzt auf " .. name)
+  else
+    print("Monitor '" .. tostring(name) .. "' nicht gefunden.")
+  end
+end
+
+local function handleMeBridgeCommand(args)
+  if not args[2] then
+    printSection("ME Bridge")
+    print("ME Bridge: " .. (resolveMeBridgeName() or "aus / keine gefunden"))
+    return
+  end
+
+  local sub = tostring(args[2]):lower()
+
+  if sub == "off" then
+    state.config.meBridgeDisabled = true
+    state.config.meBridgeName = nil
+    saveConfig()
+    scanAll(true)
+    renderMonitor()
+    print("ME Bridge deaktiviert.")
+    return
+  end
+
+  if sub == "auto" then
+    state.config.meBridgeDisabled = false
+    state.config.meBridgeName = nil
+    saveConfig()
+    scanAll(true)
+    renderMonitor()
+    print("ME Bridge wird jetzt automatisch gesucht.")
+    return
+  end
+
+  local name = args[2]
+  if peripheral.isPresent(name) and hasType(name, "meBridge") then
+    state.config.meBridgeDisabled = false
+    state.config.meBridgeName = name
+    saveConfig()
+    scanAll(true)
+    renderMonitor()
+    print("ME Bridge gesetzt auf " .. name)
+  else
+    print("ME Bridge '" .. tostring(name) .. "' nicht gefunden.")
+  end
+end
+
+local function handleIntervalCommand(args)
+  local scanValue = tonumber(args[2] or "")
+  local pageValue = tonumber(args[3] or "")
+
+  if not scanValue then
+    print("Bitte mindestens das Scan-Intervall angeben.")
+    return
+  end
+
+  state.config.scanInterval = math.max(2, math.floor(scanValue))
+  if pageValue then
+    state.config.pageInterval = math.max(2, math.floor(pageValue))
+  end
+
+  saveConfig()
+  print("Intervalle gesetzt: Scan " .. tostring(state.config.scanInterval) .. "s | Seitenwechsel " .. tostring(state.config.pageInterval) .. "s")
+end
+
+local function handlePageCommand(args)
+  local pages = buildMonitorPages(state.snapshot)
+  if #pages == 0 then
+    print("Keine Monitorseiten vorhanden.")
+    return
+  end
+
+  if not args[2] then
+    print("Aktuelle Seite: " .. tostring(state.page) .. "/" .. tostring(#pages) .. " - " .. pages[state.page].title)
+    return
+  end
+
+  local sub = tostring(args[2]):lower()
+  if sub == "next" then
+    state.page = state.page + 1
+    if state.page > #pages then
+      state.page = 1
+    end
+  elseif sub == "prev" then
+    state.page = state.page - 1
+    if state.page < 1 then
+      state.page = #pages
+    end
+  else
+    local pageNumber = tonumber(sub)
+    if not pageNumber then
+      print("Bitte Seitenzahl, 'next' oder 'prev' angeben.")
+      return
+    end
+    state.page = math.max(1, math.min(#pages, math.floor(pageNumber)))
+  end
+
+  state.lastPageSwitch = nowMs()
+  renderMonitor()
+  print("Seite: " .. tostring(state.page) .. "/" .. tostring(#pages) .. " - " .. pages[state.page].title)
+end
+
+local function handleCommand(line)
+  line = trim(line)
+  if line == "" then
+    return true
+  end
+
+  local args = {}
+  for token in line:gmatch("%S+") do
+    args[#args + 1] = token
+  end
+
+  local cmd = tostring(args[1] or ""):lower()
+
+  if cmd == "help" or cmd == "hilfe" then
+    showHelp()
+  elseif cmd == "scan" or cmd == "refresh" then
+    scanAll(false)
+    renderMonitor()
+  elseif cmd == "status" then
+    showStatus()
+  elseif cmd == "top" then
+    showTop(args[2])
+  elseif cmd == "mods" then
+    showMods(args[2])
+  elseif cmd == "inv" or cmd == "inventare" or cmd == "lager" then
+    showInventories(args[2])
+  elseif cmd == "me" then
+    showMe()
+  elseif cmd == "fluids" then
+    showFluids(args[2])
+  elseif cmd == "craft" or cmd == "craftables" then
+    showCraftables(args[2])
+  elseif cmd == "energy" or cmd == "strom" then
+    showEnergy()
+  elseif cmd == "find" or cmd == "suche" then
+    local term = trim(line:sub(#args[1] + 1))
+    showFind(term)
+  elseif cmd == "changes" or cmd == "aenderungen" or cmd == "anderungen" then
+    showChanges(args[2])
+  elseif cmd == "periph" or cmd == "peripherals" then
+    showPeripherals()
+  elseif cmd == "monitor" then
+    handleMonitorCommand(args)
+  elseif cmd == "mebridge" then
+    handleMeBridgeCommand(args)
+  elseif cmd == "intervall" or cmd == "interval" then
+    handleIntervalCommand(args)
+  elseif cmd == "seite" or cmd == "page" then
+    handlePageCommand(args)
+  elseif cmd == "exit" or cmd == "quit" or cmd == "ende" then
+    state.running = false
+    return false
+  else
+    print("Unbekannter Befehl: " .. cmd)
+    print("Mit 'help' bekommst du alle Befehle.")
+  end
+
+  return true
+end
+
+local function backgroundLoop()
+  while state.running do
+    local now = nowMs()
+
+    if (not state.snapshot) or (now - state.lastScan >= (state.config.scanInterval * 1000)) then
+      scanAll(true)
+      renderMonitor()
+    end
+
+    if state.snapshot then
+      local pages = buildMonitorPages(state.snapshot)
+      if #pages > 1 and (now - state.lastPageSwitch >= (state.config.pageInterval * 1000)) then
+        state.page = state.page + 1
+        if state.page > #pages then
+          state.page = 1
+        end
+        state.lastPageSwitch = now
+        renderMonitor()
+      end
+    end
+
+    sleep(1)
+  end
 end
 
 local function commandLoop()
-  term.clear()
-  term.setCursorPos(1, 1)
-  print("Lager-Abschlussmodus gestartet.")
-  print("Standard-Minecraft-Kisten werden nur noch auf Wunsch geleert.")
-  printStatus()
-  print("")
-  printHelp()
+  print("Lager Statistik gestartet.")
+  print("Nur noch Lesen / Statistiken - keine Item-Bewegung mehr.")
+  print("ME Bridge und Stromdaten werden automatisch erkannt, wenn vorhanden.")
+  print("Mit 'help' bekommst du alle Befehle.")
   print("")
 
-  while true do
-    write("lager> ")
+  scanAll(true)
+  renderMonitor()
+  showStatus()
+
+  while state.running do
+    write("stats> ")
     local line = read()
-    local args = {}
-
-    for part in line:gmatch("%S+") do
-      args[#args + 1] = part
+    if line == nil then
+      break
     end
-
-    local cmd = (args[1] or ""):lower()
-
-    if cmd == "" then
-    elseif cmd == "hilfe" then
-      printHelp()
-    elseif cmd == "status" then
-      printStatus()
-    elseif cmd == "inventare" or cmd == "kisten" then
-      listInventories()
-    elseif cmd == "zuordnung" then
-      listAssignments()
-    elseif cmd == "gruppen" then
-      printGroupOverview(50)
-    elseif cmd == "list" then
-      listItems(table.concat(args, " ", 2))
-    elseif cmd == "scan" or cmd == "neu" then
-      ensureFresh(true)
-      print("Scan fertig.")
-      printStatus()
-    elseif cmd == "umlagern" or cmd == "migrieren" then
-      finalMigrate()
-    elseif cmd == "stop" or cmd == "exit" then
-      print("Programm beendet.")
-      return
-    else
-      print("Unbekannter Befehl. 'hilfe' zeigt die Befehle.")
+    if not handleCommand(line) then
+      break
     end
   end
 end
 
-loadMap()
-loadMigrationLock()
-refreshTopology()
-ensureFresh(true)
-
-parallel.waitForAny(
-  commandLoop,
-  monitorLoop
-)
+loadConfig()
+state.lastPageSwitch = nowMs()
+parallel.waitForAny(commandLoop, backgroundLoop)
