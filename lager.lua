@@ -1,18 +1,21 @@
-
 local CONFIG_FILE = "lager_stats_config.txt"
 local ROLE_MARKER_SLOT = 1
 local DEFAULT_MONITOR_SCALE = 0.5
 local DEFAULT_SCAN_INTERVAL = 8
 local DEFAULT_PAGE_INTERVAL = 6
-local MAX_MONITOR_LINES = 18
+local LARGE_MONITOR_MIN_W = 36
+local LARGE_MONITOR_MIN_H = 18
+local MAX_SMALL_LINES = 18
 
 local state = {
   running = true,
-  page = 1,
-  lastPageSwitch = 0,
-  lastScan = 0,
   snapshot = nil,
   previous = nil,
+  page = 1,
+  tick = 0,
+  easterUnlocked = false,
+  lastScan = 0,
+  lastPageSwitch = 0,
   config = {
     monitorName = nil,
     monitorDisabled = false,
@@ -48,19 +51,15 @@ end
 
 local function clip(text, maxLen)
   text = tostring(text or "")
-
   if maxLen <= 0 then
     return ""
   end
-
   if #text <= maxLen then
     return text
   end
-
   if maxLen == 1 then
     return text:sub(1, 1)
   end
-
   return text:sub(1, maxLen - 1) .. ">"
 end
 
@@ -77,6 +76,28 @@ local function formatCount(n)
   return s .. out
 end
 
+local function formatCompact(n)
+  n = tonumber(n) or 0
+  local abs = math.abs(n)
+  local value = n
+  local suffix = ""
+
+  if abs >= 1000000000 then
+    value = n / 1000000000
+    suffix = "G"
+  elseif abs >= 1000000 then
+    value = n / 1000000
+    suffix = "M"
+  elseif abs >= 1000 then
+    value = n / 1000
+    suffix = "k"
+  else
+    return formatCount(n)
+  end
+
+  return (string.format("%.1f%s", value, suffix):gsub("%.0([kMG])$", "%1"))
+end
+
 local function formatMaybeCount(n)
   if n == nil then
     return "-"
@@ -87,11 +108,9 @@ end
 local function formatPercent(part, total)
   part = tonumber(part) or 0
   total = tonumber(total) or 0
-
   if total <= 0 then
     return "0.0%"
   end
-
   return string.format("%.1f%%", (part / total) * 100)
 end
 
@@ -106,11 +125,9 @@ local function formatEnergy(stored, capacity)
   if stored == nil and capacity == nil then
     return "-"
   end
-
   if capacity and capacity > 0 then
     return formatCount(stored or 0) .. "/" .. formatCount(capacity) .. " FE"
   end
-
   return formatCount(stored or 0) .. " FE"
 end
 
@@ -214,7 +231,6 @@ local function safeWrap(name)
   if ok then
     return value
   end
-
   return nil
 end
 
@@ -231,7 +247,6 @@ local function safeCall(object, methodName, ...)
   if ok then
     return a, b, c, d
   end
-
   return nil
 end
 
@@ -242,7 +257,6 @@ local function firstNumericCall(object, methods)
       return value, methodName
     end
   end
-
   return nil, nil
 end
 
@@ -310,6 +324,22 @@ local function saveConfig()
   writeFile(CONFIG_FILE, textutils.serialize(state.config))
 end
 
+local function monitorArea(name)
+  if not name or not peripheral.isPresent(name) or not hasType(name, "monitor") then
+    return 0, 0, 0
+  end
+
+  local monitor = safeWrap(name)
+  if not monitor then
+    return 0, 0, 0
+  end
+
+  local width, height = safeCall(monitor, "getSize")
+  width = math.floor(tonumber(width) or 0)
+  height = math.floor(tonumber(height) or 0)
+  return width * height, width, height
+end
+
 local function resolveMonitorName()
   if state.config.monitorDisabled then
     return nil
@@ -319,13 +349,27 @@ local function resolveMonitorName()
     return state.config.monitorName
   end
 
+  local bestName = nil
+  local bestArea = -1
+  local bestWidth = -1
+  local bestHeight = -1
+
   for _, name in ipairs(sortedNames()) do
     if hasType(name, "monitor") then
-      return name
+      local area, width, height = monitorArea(name)
+      if area > bestArea
+        or (area == bestArea and width > bestWidth)
+        or (area == bestArea and width == bestWidth and height > bestHeight)
+        or (area == bestArea and width == bestWidth and height == bestHeight and (not bestName or tostring(name) < tostring(bestName))) then
+        bestName = name
+        bestArea = area
+        bestWidth = width
+        bestHeight = height
+      end
     end
   end
 
-  return nil
+  return bestName
 end
 
 local function resolveMeBridgeName()
@@ -344,6 +388,49 @@ local function resolveMeBridgeName()
   end
 
   return nil
+end
+
+local function resolveSpeakerName()
+  for _, name in ipairs(sortedNames()) do
+    if hasType(name, "speaker") then
+      return name
+    end
+  end
+  return nil
+end
+
+local function playSecretJingle()
+  local name = resolveSpeakerName()
+  if not name then
+    return false
+  end
+
+  local speaker = safeWrap(name)
+  if not speaker then
+    return false
+  end
+
+  if hasMethod(speaker, "playNote") then
+    local sequence = {
+      { "bell", 3, 12 },
+      { "bell", 3, 16 },
+      { "chime", 3, 19 },
+      { "bell", 3, 24 },
+    }
+
+    for _, note in ipairs(sequence) do
+      pcall(speaker.playNote, note[1], note[2], note[3])
+      sleep(0.12)
+    end
+    return true
+  end
+
+  if hasMethod(speaker, "playSound") then
+    pcall(speaker.playSound, "block.note_block.bell", 1, 1)
+    return true
+  end
+
+  return false
 end
 
 local function parseMarker(detail)
@@ -366,7 +453,7 @@ local function parseMarker(detail)
   return normalized:sub(7)
 end
 
-local function inventoryMarker(name, inv)
+local function inventoryMarker(inv)
   if not inv then
     return nil
   end
@@ -379,8 +466,8 @@ local function inventoryMarker(name, inv)
   return parseMarker(detail)
 end
 
-local function isIgnoredInventory(name, inv)
-  local marker = inventoryMarker(name, inv)
+local function isIgnoredInventory(inv)
+  local marker = inventoryMarker(inv)
   return marker == "IGNORE" or marker == "OFF"
 end
 
@@ -475,7 +562,7 @@ local function buildLocalStats()
   for _, name in ipairs(sortedNames()) do
     if hasType(name, "inventory") then
       local inv = safeWrap(name)
-      if inv and not isIgnoredInventory(name, inv) then
+      if inv and not isIgnoredInventory(inv) then
         local size = tonumber(safeCall(inv, "size")) or 0
         local list = safeCall(inv, "list") or {}
         local used = 0
@@ -543,10 +630,10 @@ local function buildMeStats()
       modCounts = {},
       craftableCount = 0,
       fluidCount = 0,
-      cellCount = 0,
-      cpuCount = 0,
       totalItems = 0,
       uniqueItems = 0,
+      cellCount = 0,
+      cpuCount = 0,
     }
   end
 
@@ -563,10 +650,10 @@ local function buildMeStats()
       modCounts = {},
       craftableCount = 0,
       fluidCount = 0,
-      cellCount = 0,
-      cpuCount = 0,
       totalItems = 0,
       uniqueItems = 0,
+      cellCount = 0,
+      cpuCount = 0,
     }
   end
 
@@ -622,7 +709,7 @@ local function buildMeStats()
     return tostring(a.displayName) < tostring(b.displayName)
   end)
 
-  local fluids = safeCall(bridge, "listFluid") or {}
+  local fluids = safeCall(bridge, "listFluid") or safeCall(bridge, "listFluids") or {}
   for _, fluid in pairs(fluids) do
     if fluid and fluid.name then
       local amount = tonumber(fluid.amount or fluid.count or 0) or 0
@@ -650,11 +737,10 @@ local function buildMeStats()
   stats.modOrder = sortModMap(stats.modCounts)
   stats.craftableCount = #stats.craftables
   stats.fluidCount = #stats.fluids
-  stats.cellCount = 0
+
   for _ in pairs(stats.cells) do
     stats.cellCount = stats.cellCount + 1
   end
-  stats.cpuCount = 0
   for _ in pairs(stats.cpus) do
     stats.cpuCount = stats.cpuCount + 1
   end
@@ -697,7 +783,6 @@ local function buildCombinedStats(localStats, meStats)
   for _, entry in ipairs(localStats.order or {}) do
     mergeExistingEntry(entry)
   end
-
   for _, entry in ipairs(meStats.order or {}) do
     mergeExistingEntry(entry)
   end
@@ -767,15 +852,10 @@ local function buildEnergyStats(meStats)
   end
 
   table.sort(stats.sources, function(a, b)
-    local aKey = math.abs(a.rate or 0)
-    local bKey = math.abs(b.rate or 0)
+    local aKey = math.abs(a.rate or a.usage or a.stored or 0)
+    local bKey = math.abs(b.rate or b.usage or b.stored or 0)
     if aKey ~= bKey then
       return aKey > bKey
-    end
-    local aStored = a.stored or 0
-    local bStored = b.stored or 0
-    if aStored ~= bStored then
-      return aStored > bStored
     end
     return tostring(a.name) < tostring(b.name)
   end)
@@ -816,10 +896,8 @@ local function buildPeripheralSummary()
     end
 
     local obj = safeWrap(name)
-    if obj then
-      if firstNumericCall(obj, { "getTransferRate", "getEnergyStorage", "getEnergyStored", "getEnergy", "getEnergyUsage" }) ~= nil then
-        summary.energy = summary.energy + 1
-      end
+    if obj and firstNumericCall(obj, { "getTransferRate", "getEnergyStorage", "getEnergyStored", "getEnergy", "getEnergyUsage" }) ~= nil then
+      summary.energy = summary.energy + 1
     end
 
     summary.list[#summary.list + 1] = {
@@ -872,6 +950,25 @@ local function buildChanges(previous, current)
   return changes
 end
 
+local function countMatchingItems(snapshot, patterns)
+  if not snapshot or not snapshot.combined then
+    return 0
+  end
+
+  local total = 0
+  for _, entry in ipairs(snapshot.combined.order or {}) do
+    local hay = (tostring(entry.displayName or "") .. " " .. tostring(entry.name or "")):lower()
+    for _, pattern in ipairs(patterns or {}) do
+      if hay:find(pattern, 1, true) then
+        total = total + (entry.totalCount or 0)
+        break
+      end
+    end
+  end
+
+  return total
+end
+
 local function scanAll(silent)
   local previous = state.snapshot
   local snapshot = {
@@ -905,10 +1002,11 @@ local function currentMonitor()
   return safeWrap(name), name
 end
 
-local function addPage(pages, title, lines)
+local function addPage(pages, title, lines, kind)
   pages[#pages + 1] = {
     title = title,
     lines = lines,
+    kind = kind or title,
   }
 end
 
@@ -918,7 +1016,7 @@ local function buildMonitorPages(snapshot)
     addPage(pages, "Warten", {
       "Noch kein Scan vorhanden.",
       "Bitte 'scan' ausfuehren.",
-    })
+    }, "waiting")
     return pages
   end
 
@@ -927,62 +1025,42 @@ local function buildMonitorPages(snapshot)
   local combined = snapshot.combined
   local energy = snapshot.energy
 
-  addPage(pages, "Uebersicht", {
+  addPage(pages, "Cockpit", {
     "Lokale Inventare: " .. formatCount(localStats.inventoryCount),
     "Lokale Slots: " .. formatCount(localStats.usedSlots) .. "/" .. formatCount(localStats.totalSlots) .. " (" .. formatPercent(localStats.usedSlots, localStats.totalSlots) .. ")",
     "Lokale Items: " .. formatCount(localStats.totalItems),
     "Lokale Typen: " .. formatCount(localStats.uniqueItems),
     "ME Bridge: " .. (meStats.available and meStats.name or "nicht gefunden"),
     "ME Items: " .. formatCount(meStats.totalItems),
-    "ME Typen: " .. formatCount(meStats.uniqueItems),
-    "ME craftbar: " .. formatCount(meStats.craftableCount),
     "Kombi Items: " .. formatCount(combined.totalItems),
     "Kombi Typen: " .. formatCount(combined.uniqueItems),
-    "Energie-Quellen: " .. formatCount(#energy.sources),
+    "Stromquellen: " .. formatCount(#energy.sources),
     "Letzter Scan: " .. formatSince(snapshot.time),
-  })
+  }, "dashboard")
 
   local topItemLines = {}
   if #combined.order == 0 then
     topItemLines[#topItemLines + 1] = "Keine Items gefunden."
   else
-    for i = 1, math.min(MAX_MONITOR_LINES, #combined.order) do
+    for i = 1, math.min(MAX_SMALL_LINES, #combined.order) do
       local entry = combined.order[i]
       local top = tostring(i) .. ". " .. entry.displayName .. " " .. formatCount(entry.totalCount)
-      if entry.localCount > 0 and entry.meCount > 0 then
-        top = top .. " [L " .. formatCount(entry.localCount) .. " | ME " .. formatCount(entry.meCount) .. "]"
-      elseif entry.localCount > 0 then
-        top = top .. " [L]"
-      elseif entry.meCount > 0 then
-        top = top .. " [ME]"
-      end
       topItemLines[#topItemLines + 1] = top
     end
   end
-  addPage(pages, "Top Items", topItemLines)
+  addPage(pages, "Top Items", topItemLines, "items")
 
-  local modLines = {}
-  if #combined.modOrder == 0 then
-    modLines[#modLines + 1] = "Keine Mods gefunden."
-  else
-    for i = 1, math.min(MAX_MONITOR_LINES, #combined.modOrder) do
-      local entry = combined.modOrder[i]
-      modLines[#modLines + 1] = tostring(i) .. ". " .. entry.label .. " " .. formatCount(entry.count)
-    end
-  end
-  addPage(pages, "Mods", modLines)
-
-  local invLines = {}
+  local storageLines = {}
   if #localStats.inventories == 0 then
-    invLines[#invLines + 1] = "Keine lokalen Inventare."
+    storageLines[#storageLines + 1] = "Keine lokalen Inventare."
   else
-    for i = 1, math.min(MAX_MONITOR_LINES, #localStats.inventories) do
+    for i = 1, math.min(MAX_SMALL_LINES, #localStats.inventories) do
       local inv = localStats.inventories[i]
-      invLines[#invLines + 1] = tostring(i) .. ". " .. inv.name
-      invLines[#invLines + 1] = "   " .. formatCount(inv.totalItems) .. " Items | " .. formatCount(inv.usedSlots) .. "/" .. formatCount(inv.size) .. " Slots"
+      storageLines[#storageLines + 1] = tostring(i) .. ". " .. inv.name
+      storageLines[#storageLines + 1] = "   " .. formatCount(inv.totalItems) .. " Items | " .. formatCount(inv.usedSlots) .. "/" .. formatCount(inv.size) .. " Slots"
     end
   end
-  addPage(pages, "Inventare", invLines)
+  addPage(pages, "Lager", storageLines, "storage")
 
   local meLines = {}
   if not meStats.available then
@@ -995,20 +1073,8 @@ local function buildMonitorPages(snapshot)
     meLines[#meLines + 1] = "ME Verbrauch: " .. formatRate(meStats.energyUsage)
     meLines[#meLines + 1] = "Craftbar: " .. formatCount(meStats.craftableCount)
     meLines[#meLines + 1] = "Fluids: " .. formatCount(meStats.fluidCount) .. " Typen"
-    meLines[#meLines + 1] = "Zellen: " .. formatCount(meStats.cellCount)
-    meLines[#meLines + 1] = "CPUs: " .. formatCount(meStats.cpuCount)
-
-    local shown = 0
-    for i = 1, math.min(6, #meStats.fluids) do
-      local fluid = meStats.fluids[i]
-      meLines[#meLines + 1] = "F " .. fluid.displayName .. " " .. formatCount(fluid.amount)
-      shown = shown + 1
-    end
-    if shown == 0 then
-      meLines[#meLines + 1] = "Keine Fluids in der ME erkannt."
-    end
   end
-  addPage(pages, "ME System", meLines)
+  addPage(pages, "ME System", meLines, "me")
 
   local energyLines = {}
   if #energy.sources == 0 then
@@ -1019,7 +1085,7 @@ local function buildMonitorPages(snapshot)
     energyLines[#energyLines + 1] = "Gespeichert: " .. formatEnergy(energy.totalStored, energy.totalCapacity)
     energyLines[#energyLines + 1] = "Transfer: " .. formatRate(energy.totalRate)
     energyLines[#energyLines + 1] = "Verbrauch: " .. formatRate(energy.totalUsage)
-    for i = 1, math.min(MAX_MONITOR_LINES - 3, #energy.sources) do
+    for i = 1, math.min(MAX_SMALL_LINES - 3, #energy.sources) do
       local src = energy.sources[i]
       local line = src.name .. " "
       if src.rate ~= nil then
@@ -1032,22 +1098,761 @@ local function buildMonitorPages(snapshot)
       energyLines[#energyLines + 1] = line
     end
   end
-  addPage(pages, "Strom", energyLines)
+  addPage(pages, "Strom", energyLines, "energy")
 
   local changeLines = {}
   if #snapshot.changes == 0 then
     changeLines[#changeLines + 1] = "Seit dem letzten Scan keine"
     changeLines[#changeLines + 1] = "Aenderungen erkannt."
   else
-    for i = 1, math.min(MAX_MONITOR_LINES, #snapshot.changes) do
+    for i = 1, math.min(MAX_SMALL_LINES, #snapshot.changes) do
       local entry = snapshot.changes[i]
       local prefix = entry.delta > 0 and "+" or ""
       changeLines[#changeLines + 1] = tostring(i) .. ". " .. entry.displayName .. " " .. prefix .. formatCount(entry.delta)
     end
   end
-  addPage(pages, "Aenderungen", changeLines)
+  addPage(pages, "Aenderungen", changeLines, "changes")
+
+  if state.easterUnlocked then
+    addPage(pages, "Marcel", {
+      "Marcel-Modus aktiv.",
+      "Kekse im Netz: " .. formatCount(countMatchingItems(snapshot, { "cookie", "keks" })),
+      "Kuchen im Netz: " .. formatCount(countMatchingItems(snapshot, { "cake", "kuchen" })),
+      "Tipp: 'marcel' schaltet wieder aus.",
+    }, "easter")
+  end
 
   return pages
+end
+
+local function padRight(text, width)
+  text = tostring(text or "")
+  if width <= 0 then
+    return ""
+  end
+  if #text >= width then
+    return text:sub(1, width)
+  end
+  return text .. string.rep(" ", width - #text)
+end
+
+local function monitorSize(monitor)
+  local width, height = safeCall(monitor, "getSize")
+  return math.floor(tonumber(width) or 0), math.floor(tonumber(height) or 0)
+end
+
+local function isLargeMonitor(width, height)
+  return width >= LARGE_MONITOR_MIN_W and height >= LARGE_MONITOR_MIN_H
+end
+
+local function writeAt(monitor, x, y, text, fg, bg, maxWidth)
+  local width, height = monitorSize(monitor)
+  if width <= 0 or height <= 0 or y < 1 or y > height or x > width then
+    return
+  end
+
+  text = tostring(text or "")
+  if x < 1 then
+    local skip = 1 - x
+    if skip >= #text then
+      return
+    end
+    text = text:sub(skip + 1)
+    x = 1
+  end
+
+  local available = width - x + 1
+  if maxWidth then
+    available = math.min(available, maxWidth)
+  end
+  if available <= 0 then
+    return
+  end
+
+  text = clip(text, available)
+  if bg then
+    pcall(monitor.setBackgroundColor, bg)
+  end
+  if fg then
+    pcall(monitor.setTextColor, fg)
+  end
+  pcall(monitor.setCursorPos, x, y)
+  pcall(monitor.write, text)
+end
+
+local function fillRect(monitor, x, y, width, height, bg, char, fg)
+  if width <= 0 or height <= 0 then
+    return
+  end
+
+  local line = string.rep(char or " ", width)
+  for row = 0, height - 1 do
+    writeAt(monitor, x, y + row, line, fg or colors.white, bg, width)
+  end
+end
+
+local function drawPanel(monitor, x, y, width, height, title, titleBg, bodyBg, titleFg)
+  if width < 4 or height < 3 then
+    return
+  end
+
+  titleBg = titleBg or colors.blue
+  bodyBg = bodyBg or colors.black
+  titleFg = titleFg or colors.white
+
+  fillRect(monitor, x, y, width, height, bodyBg, " ")
+  fillRect(monitor, x, y, width, 1, titleBg, " ")
+  writeAt(monitor, x + 1, y, " " .. clip(title or "", math.max(1, width - 2)), titleFg, titleBg, math.max(1, width - 2))
+end
+
+local function drawCard(monitor, x, y, width, height, title, value, subtitle, accent)
+  if width < 8 or height < 4 then
+    return
+  end
+
+  drawPanel(monitor, x, y, width, height, title, accent or colors.blue, colors.black, colors.white)
+  writeAt(monitor, x + 2, y + 2, clip(value or "-", math.max(1, width - 4)), colors.white, colors.black, math.max(1, width - 4))
+  if subtitle then
+    writeAt(monitor, x + 2, y + 3, clip(subtitle, math.max(1, width - 4)), colors.lightGray, colors.black, math.max(1, width - 4))
+  end
+end
+
+local function drawBar(monitor, x, y, width, value, maximum, label, fillColor, emptyColor, textColor)
+  if width <= 0 then
+    return
+  end
+
+  fillRect(monitor, x, y, width, 1, emptyColor or colors.gray, " ")
+  value = tonumber(value) or 0
+  maximum = tonumber(maximum) or 0
+  local fill = 0
+  if maximum > 0 and value > 0 then
+    fill = math.floor((value / maximum) * width + 0.5)
+    if fill < 1 then
+      fill = 1
+    end
+    if fill > width then
+      fill = width
+    end
+  end
+  if fill > 0 then
+    fillRect(monitor, x, y, fill, 1, fillColor or colors.green, " ")
+  end
+
+  writeAt(monitor, x + 1, y, clip(label or "", math.max(1, width - 2)), textColor or colors.white, nil, math.max(1, width - 2))
+end
+
+local function drawRows(monitor, x, y, width, height, rows, fg, bg)
+  for i = 1, math.min(height, #(rows or {})) do
+    writeAt(monitor, x, y + i - 1, padRight(clip(rows[i], width), width), fg or colors.white, bg, width)
+  end
+end
+
+local function worldClock()
+  local ok, value = pcall(textutils.formatTime, os.time(), true)
+  if ok and value then
+    return value
+  end
+  return "-"
+end
+
+local function spinner()
+  local frames = { "|", "/", "-", "\\" }
+  return frames[(state.tick % #frames) + 1]
+end
+
+local function drawHeader(monitor, width, pageIndex, pageCount, title, snapshot, name)
+  fillRect(monitor, 1, 1, width, 3, colors.black, " ")
+  fillRect(monitor, 1, 1, width, 1, colors.blue, " ")
+
+  local right = "Seite " .. tostring(pageIndex) .. "/" .. tostring(pageCount) .. " | " .. worldClock()
+  local left = "LAGERNETZ // " .. tostring(title or "Monitor")
+  writeAt(monitor, 2, 1, left, colors.white, colors.blue, math.max(1, width - #right - 3))
+  writeAt(monitor, math.max(2, width - #right + 1), 1, right, colors.white, colors.blue, #right)
+
+  local line2 = "Monitor: " .. tostring(name or "-") .. " | Letzter Scan: " .. formatSince(snapshot and snapshot.time or 0) .. " | Auto: groesster Monitor"
+  local line3 = "Lokal " .. formatCompact(snapshot.localStats.totalItems) .. " | ME " .. formatCompact(snapshot.me.totalItems) .. " | Typen " .. formatCompact(snapshot.combined.uniqueItems) .. " | Strom " .. formatCompact(snapshot.energy.totalStored) .. " FE"
+  writeAt(monitor, 2, 2, clip(line2, width - 2), colors.lightGray, colors.black, width - 2)
+  writeAt(monitor, 2, 3, clip(line3, width - 2), colors.cyan, colors.black, width - 2)
+end
+
+local function drawFooter(monitor, width, height, pages, pageIndex)
+  fillRect(monitor, 1, height, width, 1, colors.black, " ")
+
+  local x = 1
+  for i, page in ipairs(pages or {}) do
+    local label = " " .. tostring(i) .. ":" .. clip(page.title, 10) .. " "
+    local bg = (i == pageIndex) and colors.orange or colors.gray
+    local fg = (i == pageIndex) and colors.black or colors.white
+    if x <= width then
+      local part = clip(label, width - x + 1)
+      fillRect(monitor, x, height, #part, 1, bg, " ")
+      writeAt(monitor, x, height, part, fg, bg, #part)
+      x = x + #part
+    end
+    if x > width then
+      break
+    end
+  end
+
+  local status = " " .. spinner() .. " stats> 'seite <n>' | geheim: 'marcel' "
+  local startX = math.max(1, width - #status + 1)
+  fillRect(monitor, startX, height, math.min(width, #status), 1, colors.blue, " ")
+  writeAt(monitor, startX, height, clip(status, width - startX + 1), colors.white, colors.blue, width - startX + 1)
+end
+
+local function renderDashboardPage(monitor, width, height, snapshot)
+  local cardY = 4
+  local cardH = 4
+  local gap = 1
+  local cardCount = 4
+  local cardWidth = math.max(10, math.floor((width - ((cardCount - 1) * gap)) / cardCount))
+
+  local cards = {
+    {
+      title = "Items gesamt",
+      value = formatCompact(snapshot.combined.totalItems),
+      subtitle = "Lokal " .. formatCompact(snapshot.localStats.totalItems) .. " | ME " .. formatCompact(snapshot.me.totalItems),
+      accent = colors.green,
+    },
+    {
+      title = "Typen",
+      value = formatCompact(snapshot.combined.uniqueItems),
+      subtitle = "Mods " .. formatCompact(#snapshot.combined.modOrder),
+      accent = colors.cyan,
+    },
+    {
+      title = "ME Speicher",
+      value = snapshot.me.available and formatPercent(snapshot.me.usedItemStorage, snapshot.me.totalItemStorage) or "offline",
+      subtitle = snapshot.me.available and (formatMaybeCount(snapshot.me.usedItemStorage) .. "/" .. formatMaybeCount(snapshot.me.totalItemStorage)) or "Keine Bridge",
+      accent = colors.purple,
+    },
+    {
+      title = "Strom",
+      value = formatCompact(snapshot.energy.totalStored) .. " FE",
+      subtitle = "Use " .. formatRate(snapshot.energy.totalUsage),
+      accent = colors.red,
+    },
+  }
+
+  for i, card in ipairs(cards) do
+    local x = 1 + (i - 1) * (cardWidth + gap)
+    local w = cardWidth
+    if i == #cards then
+      w = width - x + 1
+    end
+    drawCard(monitor, x, cardY, w, cardH, card.title, card.value, card.subtitle, card.accent)
+  end
+
+  local bodyY = cardY + cardH + 1
+  local bodyH = math.max(6, height - bodyY - 1)
+  local leftW = math.max(18, math.floor(width * 0.60))
+  local rightW = width - leftW - 1
+  local rightTopH = math.max(6, math.floor(bodyH * 0.55))
+  local rightBottomH = bodyH - rightTopH - 1
+
+  drawPanel(monitor, 1, bodyY, leftW, bodyH, "Top Items", colors.green, colors.black, colors.white)
+  local maxValue = (#snapshot.combined.order > 0 and snapshot.combined.order[1].totalCount) or 0
+  local maxRows = math.max(1, bodyH - 2)
+  for i = 1, math.min(maxRows, #snapshot.combined.order) do
+    local entry = snapshot.combined.order[i]
+    local label = tostring(i) .. ". " .. clip(entry.displayName, math.max(6, leftW - 18)) .. " " .. formatCompact(entry.totalCount)
+    drawBar(monitor, 2, bodyY + i, leftW - 2, entry.totalCount, maxValue, label, colors.green, colors.gray, colors.white)
+  end
+  if #snapshot.combined.order == 0 then
+    writeAt(monitor, 3, bodyY + 2, "Keine Items erkannt.", colors.lightGray, colors.black, leftW - 4)
+  end
+
+  drawPanel(monitor, leftW + 2, bodyY, rightW, rightTopH, "Netzwerk", colors.cyan, colors.black, colors.white)
+  local networkRows = {
+    "Inventare: " .. formatCount(snapshot.localStats.inventoryCount),
+    "Lokale Slots: " .. formatCount(snapshot.localStats.usedSlots) .. "/" .. formatCount(snapshot.localStats.totalSlots),
+    "ME Bridge: " .. (snapshot.me.available and "online" or "offline"),
+    "Craftbar: " .. formatCount(snapshot.me.craftableCount),
+    "Fluids: " .. formatCount(snapshot.me.fluidCount),
+    "Peripherals: " .. formatCount(snapshot.peripherals.total),
+    "Monitorseiten: " .. tostring(#buildMonitorPages(snapshot)),
+  }
+  drawRows(monitor, leftW + 3, bodyY + 2, rightW - 2, rightTopH - 2, networkRows, colors.white, colors.black)
+
+  if rightBottomH >= 3 then
+    drawPanel(monitor, leftW + 2, bodyY + rightTopH + 1, rightW, rightBottomH, "Aenderungen", colors.orange, colors.black, colors.white)
+    if #snapshot.changes == 0 then
+      writeAt(monitor, leftW + 3, bodyY + rightTopH + 3, "Keine Aenderungen seit dem letzten Scan.", colors.lightGray, colors.black, rightW - 2)
+    else
+      for i = 1, math.min(rightBottomH - 2, #snapshot.changes) do
+        local entry = snapshot.changes[i]
+        local prefix = entry.delta > 0 and "+" or ""
+        local row = tostring(i) .. ". " .. clip(entry.displayName, math.max(6, rightW - 16)) .. " " .. prefix .. formatCompact(entry.delta)
+        local fg = entry.delta >= 0 and colors.lime or colors.red
+        writeAt(monitor, leftW + 3, bodyY + rightTopH + 1 + i, row, fg, colors.black, rightW - 2)
+      end
+    end
+  end
+end
+
+local function renderItemsPage(monitor, width, height, snapshot)
+  local topY = 4
+  local topH = math.max(6, height - topY - 1)
+  local leftW = math.max(20, math.floor(width * 0.63))
+  local rightW = width - leftW - 1
+
+  drawPanel(monitor, 1, topY, leftW, topH, "Top Items im ganzen Netzwerk", colors.green, colors.black, colors.white)
+  if #snapshot.combined.order == 0 then
+    writeAt(monitor, 3, topY + 2, "Keine Items gefunden.", colors.lightGray, colors.black, leftW - 4)
+  else
+    local maxValue = snapshot.combined.order[1].totalCount or 0
+    for i = 1, math.min(topH - 2, #snapshot.combined.order) do
+      local entry = snapshot.combined.order[i]
+      local tag = ""
+      if entry.localCount > 0 and entry.meCount > 0 then
+        tag = " L/ME"
+      elseif entry.meCount > 0 then
+        tag = " ME"
+      else
+        tag = " L"
+      end
+      local label = tostring(i) .. ". " .. clip(entry.displayName, math.max(8, leftW - 20)) .. " " .. formatCompact(entry.totalCount) .. tag
+      drawBar(monitor, 2, topY + i, leftW - 2, entry.totalCount, maxValue, label, colors.green, colors.gray, colors.white)
+    end
+  end
+
+  local upperH = math.max(7, math.floor(topH * 0.52))
+  drawPanel(monitor, leftW + 2, topY, rightW, upperH, "Top Mods", colors.purple, colors.black, colors.white)
+  if #snapshot.combined.modOrder == 0 then
+    writeAt(monitor, leftW + 3, topY + 2, "Keine Mod-Daten.", colors.lightGray, colors.black, rightW - 2)
+  else
+    local modMax = snapshot.combined.modOrder[1].count or 0
+    for i = 1, math.min(upperH - 2, #snapshot.combined.modOrder) do
+      local entry = snapshot.combined.modOrder[i]
+      local label = tostring(i) .. ". " .. clip(entry.label, math.max(8, rightW - 16)) .. " " .. formatCompact(entry.count)
+      drawBar(monitor, leftW + 3, topY + i, rightW - 2, entry.count, modMax, label, colors.purple, colors.gray, colors.white)
+    end
+  end
+
+  local bottomY = topY + upperH + 1
+  local bottomH = topH - upperH - 1
+  if bottomH >= 3 then
+    drawPanel(monitor, leftW + 2, bottomY, rightW, bottomH, "Schnelle Fakten", colors.cyan, colors.black, colors.white)
+    local facts = {
+      "Lokale Items: " .. formatCount(snapshot.localStats.totalItems),
+      "ME Items: " .. formatCount(snapshot.me.totalItems),
+      "Freie Slots: " .. formatCount(snapshot.localStats.freeSlots),
+      "ME Craftbar: " .. formatCount(snapshot.me.craftableCount),
+      "Fluids: " .. formatCount(snapshot.me.fluidCount),
+      "Stromquellen: " .. formatCount(#snapshot.energy.sources),
+    }
+    drawRows(monitor, leftW + 3, bottomY + 2, rightW - 2, bottomH - 2, facts, colors.white, colors.black)
+  end
+end
+
+local function renderStoragePage(monitor, width, height, snapshot)
+  local cardY = 4
+  local cardH = 4
+  local gap = 1
+  local cardCount = 3
+  local cardWidth = math.max(12, math.floor((width - ((cardCount - 1) * gap)) / cardCount))
+  local topInv = snapshot.localStats.inventories[1]
+
+  local cards = {
+    {
+      title = "Inventare",
+      value = formatCount(snapshot.localStats.inventoryCount),
+      subtitle = "lokal verbunden",
+      accent = colors.cyan,
+    },
+    {
+      title = "Slots",
+      value = formatPercent(snapshot.localStats.usedSlots, snapshot.localStats.totalSlots),
+      subtitle = formatCount(snapshot.localStats.usedSlots) .. "/" .. formatCount(snapshot.localStats.totalSlots),
+      accent = colors.orange,
+    },
+    {
+      title = "Groesstes Lager",
+      value = topInv and formatCompact(topInv.totalItems) or "-",
+      subtitle = topInv and clip(topInv.name, math.max(8, cardWidth - 4)) or "kein Inventar",
+      accent = colors.green,
+    },
+  }
+
+  for i, card in ipairs(cards) do
+    local x = 1 + (i - 1) * (cardWidth + gap)
+    local w = cardWidth
+    if i == #cards then
+      w = width - x + 1
+    end
+    drawCard(monitor, x, cardY, w, cardH, card.title, card.value, card.subtitle, card.accent)
+  end
+
+  local bodyY = cardY + cardH + 1
+  local bodyH = math.max(6, height - bodyY - 1)
+  local leftW = math.max(20, math.floor(width * 0.58))
+  local rightW = width - leftW - 1
+
+  drawPanel(monitor, 1, bodyY, leftW, bodyH, "Inventar-Auslastung", colors.cyan, colors.black, colors.white)
+  if #snapshot.localStats.inventories == 0 then
+    writeAt(monitor, 3, bodyY + 2, "Keine lokalen Inventare erkannt.", colors.lightGray, colors.black, leftW - 4)
+  else
+    local maxItems = snapshot.localStats.inventories[1].totalItems or 0
+    for i = 1, math.min(bodyH - 2, #snapshot.localStats.inventories) do
+      local inv = snapshot.localStats.inventories[i]
+      local label = tostring(i) .. ". " .. clip(inv.name, math.max(8, leftW - 24)) .. " " .. formatCompact(inv.totalItems) .. " / " .. formatPercent(inv.usedSlots, inv.size)
+      drawBar(monitor, 2, bodyY + i, leftW - 2, inv.totalItems, maxItems, label, colors.cyan, colors.gray, colors.white)
+    end
+  end
+
+  local upperH = math.max(6, math.floor(bodyH * 0.52))
+  drawPanel(monitor, leftW + 2, bodyY, rightW, upperH, "Mod-Verteilung", colors.purple, colors.black, colors.white)
+  if #snapshot.combined.modOrder == 0 then
+    writeAt(monitor, leftW + 3, bodyY + 2, "Keine Mods erkannt.", colors.lightGray, colors.black, rightW - 2)
+  else
+    local modMax = snapshot.combined.modOrder[1].count or 0
+    for i = 1, math.min(upperH - 2, #snapshot.combined.modOrder) do
+      local entry = snapshot.combined.modOrder[i]
+      local label = tostring(i) .. ". " .. clip(entry.label, math.max(8, rightW - 16)) .. " " .. formatCompact(entry.count)
+      drawBar(monitor, leftW + 3, bodyY + i, rightW - 2, entry.count, modMax, label, colors.purple, colors.gray, colors.white)
+    end
+  end
+
+  local bottomY = bodyY + upperH + 1
+  local bottomH = bodyH - upperH - 1
+  if bottomH >= 3 then
+    drawPanel(monitor, leftW + 2, bottomY, rightW, bottomH, "Peripherals", colors.orange, colors.black, colors.white)
+    local rows = {
+      "Gesamt: " .. formatCount(snapshot.peripherals.total),
+      "Inventare: " .. formatCount(snapshot.peripherals.inventory),
+      "Monitore: " .. formatCount(snapshot.peripherals.monitor),
+      "ME Bridges: " .. formatCount(snapshot.peripherals.meBridge),
+      "Speaker: " .. formatCount(snapshot.peripherals.speaker),
+      "Stromdaten: " .. formatCount(snapshot.peripherals.energy),
+    }
+    drawRows(monitor, leftW + 3, bottomY + 2, rightW - 2, bottomH - 2, rows, colors.white, colors.black)
+  end
+end
+
+local function renderMePage(monitor, width, height, snapshot)
+  local me = snapshot.me
+  if not me.available then
+    drawPanel(monitor, 1, 4, width, height - 4, "ME System", colors.purple, colors.black, colors.white)
+    writeAt(monitor, 4, 7, "Keine ME Bridge gefunden.", colors.white, colors.black, width - 6)
+    writeAt(monitor, 4, 9, "Befehle: mebridge auto  |  mebridge <name>", colors.lightGray, colors.black, width - 6)
+    writeAt(monitor, 4, 11, "Sobald eine Bridge gefunden wird, erscheinen hier", colors.lightGray, colors.black, width - 6)
+    writeAt(monitor, 4, 12, "Items, Fluids, Speicher, Craftables und Energie.", colors.lightGray, colors.black, width - 6)
+    return
+  end
+
+  local cardY = 4
+  local cardH = 4
+  local gap = 1
+  local cardCount = 4
+  local cardWidth = math.max(10, math.floor((width - ((cardCount - 1) * gap)) / cardCount))
+  local cards = {
+    {
+      title = "ME Items",
+      value = formatCompact(me.totalItems),
+      subtitle = formatCount(me.uniqueItems) .. " Typen",
+      accent = colors.purple,
+    },
+    {
+      title = "Craftbar",
+      value = formatCompact(me.craftableCount),
+      subtitle = "Rezepte / Ziele",
+      accent = colors.cyan,
+    },
+    {
+      title = "Fluids",
+      value = formatCompact(me.fluidCount),
+      subtitle = formatCompact(me.fluidTotal) .. " Menge",
+      accent = colors.blue,
+    },
+    {
+      title = "ME Energie",
+      value = formatCompact(me.energyStorage) .. " FE",
+      subtitle = "Use " .. formatRate(me.energyUsage),
+      accent = colors.red,
+    },
+  }
+
+  for i, card in ipairs(cards) do
+    local x = 1 + (i - 1) * (cardWidth + gap)
+    local w = cardWidth
+    if i == #cards then
+      w = width - x + 1
+    end
+    drawCard(monitor, x, cardY, w, cardH, card.title, card.value, card.subtitle, card.accent)
+  end
+
+  local bodyY = cardY + cardH + 1
+  local bodyH = math.max(6, height - bodyY - 1)
+  local leftW = math.max(20, math.floor(width * 0.58))
+  local rightW = width - leftW - 1
+
+  drawPanel(monitor, 1, bodyY, leftW, bodyH, "ME Top Items", colors.purple, colors.black, colors.white)
+  if #me.order == 0 then
+    writeAt(monitor, 3, bodyY + 2, "Keine Items im ME System.", colors.lightGray, colors.black, leftW - 4)
+  else
+    local maxValue = me.order[1].meCount or me.order[1].totalCount or 0
+    for i = 1, math.min(bodyH - 2, #me.order) do
+      local entry = me.order[i]
+      local amount = entry.meCount or entry.totalCount or 0
+      local label = tostring(i) .. ". " .. clip(entry.displayName, math.max(8, leftW - 18)) .. " " .. formatCompact(amount)
+      drawBar(monitor, 2, bodyY + i, leftW - 2, amount, maxValue, label, colors.purple, colors.gray, colors.white)
+    end
+  end
+
+  local rightTopH = math.max(6, math.floor(bodyH * 0.52))
+  drawPanel(monitor, leftW + 2, bodyY, rightW, rightTopH, "Fluids", colors.blue, colors.black, colors.white)
+  if #me.fluids == 0 then
+    writeAt(monitor, leftW + 3, bodyY + 2, "Keine Fluids erkannt.", colors.lightGray, colors.black, rightW - 2)
+  else
+    local maxFluid = me.fluids[1].amount or 0
+    for i = 1, math.min(rightTopH - 2, #me.fluids) do
+      local fluid = me.fluids[i]
+      local label = tostring(i) .. ". " .. clip(fluid.displayName, math.max(8, rightW - 16)) .. " " .. formatCompact(fluid.amount)
+      drawBar(monitor, leftW + 3, bodyY + i, rightW - 2, fluid.amount, maxFluid, label, colors.blue, colors.gray, colors.white)
+    end
+  end
+
+  local bottomY = bodyY + rightTopH + 1
+  local bottomH = bodyH - rightTopH - 1
+  if bottomH >= 3 then
+    drawPanel(monitor, leftW + 2, bottomY, rightW, bottomH, "ME Status", colors.red, colors.black, colors.white)
+    local rows = {
+      "Bridge: " .. me.name,
+      "Item-Speicher: " .. formatMaybeCount(me.usedItemStorage) .. "/" .. formatMaybeCount(me.totalItemStorage),
+      "Fluid-Speicher: " .. formatMaybeCount(me.usedFluidStorage) .. "/" .. formatMaybeCount(me.totalFluidStorage),
+      "Zellen: " .. formatCount(me.cellCount),
+      "CPUs: " .. formatCount(me.cpuCount),
+      "Craftbar: " .. formatCount(me.craftableCount),
+    }
+    drawRows(monitor, leftW + 3, bottomY + 2, rightW - 2, bottomH - 2, rows, colors.white, colors.black)
+  end
+end
+
+local function renderEnergyPage(monitor, width, height, snapshot)
+  local cardY = 4
+  local cardH = 4
+  local gap = 1
+  local cardCount = 4
+  local cardWidth = math.max(10, math.floor((width - ((cardCount - 1) * gap)) / cardCount))
+  local cards = {
+    {
+      title = "Gespeichert",
+      value = formatCompact(snapshot.energy.totalStored) .. " FE",
+      subtitle = formatCompact(snapshot.energy.totalCapacity) .. " FE max",
+      accent = colors.red,
+    },
+    {
+      title = "Transfer",
+      value = formatCompact(snapshot.energy.totalRate) .. " FE/t",
+      subtitle = "gemessen",
+      accent = colors.orange,
+    },
+    {
+      title = "Verbrauch",
+      value = formatCompact(snapshot.energy.totalUsage) .. " FE/t",
+      subtitle = "gesamt",
+      accent = colors.purple,
+    },
+    {
+      title = "Quellen",
+      value = formatCount(#snapshot.energy.sources),
+      subtitle = "mit Stromdaten",
+      accent = colors.cyan,
+    },
+  }
+
+  for i, card in ipairs(cards) do
+    local x = 1 + (i - 1) * (cardWidth + gap)
+    local w = cardWidth
+    if i == #cards then
+      w = width - x + 1
+    end
+    drawCard(monitor, x, cardY, w, cardH, card.title, card.value, card.subtitle, card.accent)
+  end
+
+  local bodyY = cardY + cardH + 1
+  local bodyH = math.max(6, height - bodyY - 1)
+  local leftW = math.max(22, math.floor(width * 0.66))
+  local rightW = width - leftW - 1
+
+  drawPanel(monitor, 1, bodyY, leftW, bodyH, "Energiequellen", colors.red, colors.black, colors.white)
+  if #snapshot.energy.sources == 0 then
+    writeAt(monitor, 3, bodyY + 2, "Keine Stromdaten gefunden.", colors.lightGray, colors.black, leftW - 4)
+    writeAt(monitor, 3, bodyY + 4, "Tipp: Energy Detector oder ME Bridge anschliessen.", colors.lightGray, colors.black, leftW - 4)
+  else
+    local maxRate = 1
+    for _, src in ipairs(snapshot.energy.sources) do
+      local candidate = math.abs(src.rate or src.usage or src.stored or 0)
+      if candidate > maxRate then
+        maxRate = candidate
+      end
+    end
+
+    for i = 1, math.min(bodyH - 2, #snapshot.energy.sources) do
+      local src = snapshot.energy.sources[i]
+      local metric = math.abs(src.rate or src.usage or src.stored or 0)
+      local info = src.rate and formatRate(src.rate) or (src.usage and ("Use " .. formatRate(src.usage)) or formatEnergy(src.stored, src.capacity))
+      local label = tostring(i) .. ". " .. clip(src.name, math.max(8, leftW - 22)) .. " " .. info
+      drawBar(monitor, 2, bodyY + i, leftW - 2, metric, maxRate, label, colors.red, colors.gray, colors.white)
+    end
+  end
+
+  local upperH = math.max(6, math.floor(bodyH * 0.50))
+  drawPanel(monitor, leftW + 2, bodyY, rightW, upperH, "Delta", colors.orange, colors.black, colors.white)
+  if #snapshot.changes == 0 then
+    writeAt(monitor, leftW + 3, bodyY + 2, "Keine Aenderungen.", colors.lightGray, colors.black, rightW - 2)
+  else
+    for i = 1, math.min(upperH - 2, #snapshot.changes) do
+      local entry = snapshot.changes[i]
+      local prefix = entry.delta > 0 and "+" or ""
+      local fg = entry.delta >= 0 and colors.lime or colors.red
+      local row = tostring(i) .. ". " .. clip(entry.displayName, math.max(8, rightW - 16)) .. " " .. prefix .. formatCompact(entry.delta)
+      writeAt(monitor, leftW + 3, bodyY + 1 + i, row, fg, colors.black, rightW - 2)
+    end
+  end
+
+  local bottomY = bodyY + upperH + 1
+  local bottomH = bodyH - upperH - 1
+  if bottomH >= 3 then
+    drawPanel(monitor, leftW + 2, bottomY, rightW, bottomH, "Live Hinweise", colors.cyan, colors.black, colors.white)
+    local rows = {
+      "Scan-Intervall: " .. tostring(state.config.scanInterval) .. "s",
+      "Seitenwechsel: " .. tostring(state.config.pageInterval) .. "s",
+      "Speaker: " .. (resolveSpeakerName() or "nicht gefunden"),
+      "ME Bridge: " .. (snapshot.me.available and "online" or "offline"),
+      "Monitor: " .. tostring(snapshot.monitorName or "-"),
+    }
+    drawRows(monitor, leftW + 3, bottomY + 2, rightW - 2, bottomH - 2, rows, colors.white, colors.black)
+  end
+end
+
+local function renderChangesPage(monitor, width, height, snapshot)
+  local topY = 4
+  local boxH = math.max(6, height - topY - 1)
+  local leftW = math.max(22, math.floor(width * 0.60))
+  local rightW = width - leftW - 1
+
+  drawPanel(monitor, 1, topY, leftW, boxH, "Aenderungen seit letztem Scan", colors.orange, colors.black, colors.white)
+  if #snapshot.changes == 0 then
+    writeAt(monitor, 3, topY + 2, "Keine Aenderungen erkannt.", colors.lightGray, colors.black, leftW - 4)
+  else
+    local maxDelta = 1
+    for _, entry in ipairs(snapshot.changes) do
+      local value = math.abs(entry.delta or 0)
+      if value > maxDelta then
+        maxDelta = value
+      end
+    end
+
+    for i = 1, math.min(boxH - 2, #snapshot.changes) do
+      local entry = snapshot.changes[i]
+      local label = tostring(i) .. ". " .. clip(entry.displayName, math.max(8, leftW - 20)) .. " " .. (entry.delta > 0 and "+" or "") .. formatCompact(entry.delta)
+      local color = entry.delta >= 0 and colors.lime or colors.red
+      drawBar(monitor, 2, topY + i, leftW - 2, math.abs(entry.delta), maxDelta, label, color, colors.gray, colors.white)
+    end
+  end
+
+  drawPanel(monitor, leftW + 2, topY, rightW, boxH, "Kurzstatus", colors.cyan, colors.black, colors.white)
+  local topMod = snapshot.combined.modOrder[1]
+  local topItem = snapshot.combined.order[1]
+  local rows = {
+    "Gesamtitems: " .. formatCount(snapshot.combined.totalItems),
+    "Typen: " .. formatCount(snapshot.combined.uniqueItems),
+    "Top Mod: " .. (topMod and topMod.label or "-"),
+    "Top Item: " .. (topItem and topItem.displayName or "-"),
+    "ME online: " .. (snapshot.me.available and "ja" or "nein"),
+    "Energiequellen: " .. formatCount(#snapshot.energy.sources),
+    "Kekse im Netz: " .. formatCount(countMatchingItems(snapshot, { "cookie", "keks" })),
+    "Kuchen im Netz: " .. formatCount(countMatchingItems(snapshot, { "cake", "kuchen" })),
+  }
+  drawRows(monitor, leftW + 3, topY + 2, rightW - 2, boxH - 2, rows, colors.white, colors.black)
+end
+
+local function renderEasterPage(monitor, width, height, snapshot)
+  fillRect(monitor, 1, 4, width, height - 4, colors.black, " ")
+  local panelY = 5
+  local panelH = math.max(8, height - panelY - 1)
+  drawPanel(monitor, 2, panelY, width - 2, panelH, "Marcel-Modus", colors.magenta, colors.black, colors.white)
+
+  local cookieCount = countMatchingItems(snapshot, { "cookie", "keks" })
+  local cakeCount = countMatchingItems(snapshot, { "cake", "kuchen" })
+  local topMod = snapshot.combined.modOrder[1] and snapshot.combined.modOrder[1].label or "-"
+  local bridgeStatus = snapshot.me.available and "ME online" or "ME offline"
+
+  local art = {
+    "   __  __                       _ ",
+    "  / /_/ /  ATL10 Lagerkern    (_)",
+    " / __/ _ \\  Alles im Blick    / / ",
+    "/_/ /_//_/  Marcel-Modus     /_/  ",
+    "",
+    "Kekse im Netz : " .. formatCount(cookieCount),
+    "Kuchen im Netz: " .. formatCount(cakeCount),
+    "Lieblings-Mod : " .. topMod,
+    "Bridge-Status : " .. bridgeStatus,
+    "Top Item      : " .. ((snapshot.combined.order[1] and snapshot.combined.order[1].displayName) or "-"),
+    "",
+    "Tipp: 'marcel' schaltet dieses Easteregg wieder aus.",
+  }
+
+  local startY = panelY + 2
+  for i, line in ipairs(art) do
+    if startY + i - 1 >= height then
+      break
+    end
+    local fg = (i <= 4) and colors.magenta or colors.white
+    if line == "" then
+      fg = colors.black
+    end
+    writeAt(monitor, 5, startY + i - 1, clip(line, width - 8), fg, colors.black, width - 8)
+  end
+end
+
+local function renderLargeMonitor(monitor, name, width, height, pages, page)
+  drawHeader(monitor, width, state.page, #pages, page.title, state.snapshot, name)
+
+  if page.kind == "dashboard" then
+    renderDashboardPage(monitor, width, height, state.snapshot)
+  elseif page.kind == "items" then
+    renderItemsPage(monitor, width, height, state.snapshot)
+  elseif page.kind == "storage" then
+    renderStoragePage(monitor, width, height, state.snapshot)
+  elseif page.kind == "me" then
+    renderMePage(monitor, width, height, state.snapshot)
+  elseif page.kind == "energy" then
+    renderEnergyPage(monitor, width, height, state.snapshot)
+  elseif page.kind == "changes" then
+    renderChangesPage(monitor, width, height, state.snapshot)
+  elseif page.kind == "easter" then
+    renderEasterPage(monitor, width, height, state.snapshot)
+  else
+    drawPanel(monitor, 1, 4, width, height - 4, page.title, colors.blue, colors.black, colors.white)
+    drawRows(monitor, 3, 6, width - 4, height - 8, page.lines or {}, colors.white, colors.black)
+  end
+
+  drawFooter(monitor, width, height, pages, state.page)
+end
+
+local function renderSmallMonitor(monitor, name, width, height, pages, page)
+  local y = 1
+
+  local function monLine(text, color)
+    if y > height then
+      return
+    end
+    writeAt(monitor, 1, y, padRight(clip(text, width), width), color or colors.white, colors.black, width)
+    y = y + 1
+  end
+
+  monLine("Lager Statistik - " .. page.title, colors.cyan)
+  monLine("Monitor: " .. name .. " | Seite " .. tostring(state.page) .. "/" .. tostring(#pages), colors.lightGray)
+
+  for _, line in ipairs(page.lines or {}) do
+    if y > height then
+      break
+    end
+    monLine(line, colors.white)
+  end
 end
 
 local function renderMonitor()
@@ -1063,7 +1868,7 @@ local function renderMonitor()
   pcall(monitor.clear)
   pcall(monitor.setCursorPos, 1, 1)
 
-  local width, height = monitor.getSize()
+  local width, height = monitorSize(monitor)
   local pages = buildMonitorPages(state.snapshot)
   if #pages == 0 then
     return
@@ -1077,30 +1882,11 @@ local function renderMonitor()
   end
 
   local page = pages[state.page]
-  local y = 1
 
-  local function monLine(text, color)
-    if y > height then
-      return
-    end
-    monitor.setCursorPos(1, y)
-    if color then
-      monitor.setTextColor(color)
-    else
-      monitor.setTextColor(colors.white)
-    end
-    monitor.write(clip(text, width))
-    y = y + 1
-  end
-
-  monLine("Lager Statistik - " .. page.title, colors.cyan)
-  monLine("Monitor: " .. name .. " | Seite " .. tostring(state.page) .. "/" .. tostring(#pages), colors.lightGray)
-
-  for _, line in ipairs(page.lines or {}) do
-    if y > height then
-      break
-    end
-    monLine(line, colors.white)
+  if isLargeMonitor(width, height) and state.snapshot then
+    renderLargeMonitor(monitor, name, width, height, pages, page)
+  else
+    renderSmallMonitor(monitor, name, width, height, pages, page)
   end
 end
 
@@ -1386,8 +2172,13 @@ end
 
 local function showMonitorStatus()
   local name = resolveMonitorName()
+  local area, width, height = monitorArea(name)
   printSection("Monitor")
   print("Monitor:       " .. (name or "aus / keiner gefunden"))
+  if name then
+    print("Groesse:       " .. tostring(width) .. "x" .. tostring(height) .. " Zeichen (" .. formatCount(area) .. ")")
+    print("Auto-Auswahl:  waehlt den groessten gefundenen Monitor")
+  end
   print("Skalierung:    " .. tostring(state.config.monitorScale))
   print("Scan Intervall:" .. " " .. tostring(state.config.scanInterval) .. "s")
   print("Seitenwechsel: " .. tostring(state.config.pageInterval) .. "s")
@@ -1395,7 +2186,7 @@ end
 
 local function showHelp()
   printSection("Statistik-Modus")
-  print("Dieses Script bewegt keine Items mehr.")
+  print("Dieses Script bewegt keine Items.")
   print("Es liest nur Lager-, ME- und Stromdaten aus.")
   print("")
   print("Befehle:")
@@ -1414,7 +2205,7 @@ local function showHelp()
   print("  periph                   - erkannte Peripherals")
   print("  monitor                  - Monitorstatus")
   print("  monitor off              - Monitor deaktivieren")
-  print("  monitor auto             - Monitor automatisch finden")
+  print("  monitor auto             - groessten Monitor automatisch finden")
   print("  monitor <name>           - festen Monitor setzen")
   print("  monitor scale <wert>     - z.B. 0.5")
   print("  mebridge off             - ME Bridge deaktivieren")
@@ -1422,6 +2213,7 @@ local function showHelp()
   print("  mebridge <name>          - feste ME Bridge setzen")
   print("  intervall <scan> [page]  - Zeiten in Sekunden")
   print("  seite <n|next|prev>      - Monitorseite manuell")
+  print("  marcel                   - kleines Easteregg auf dem Monitor")
   print("  exit                     - Script beenden")
 end
 
@@ -1625,6 +2417,18 @@ local function handleCommand(line)
     handleIntervalCommand(args)
   elseif cmd == "seite" or cmd == "page" then
     handlePageCommand(args)
+  elseif cmd == "marcel" or cmd == "easteregg" or cmd == "party" then
+    state.easterUnlocked = not state.easterUnlocked
+    if state.easterUnlocked then
+      playSecretJingle()
+      local pages = buildMonitorPages(state.snapshot)
+      state.page = #pages
+      print("Marcel-Modus aktiviert. Schau auf den Monitor.")
+    else
+      state.page = 1
+      print("Marcel-Modus deaktiviert.")
+    end
+    renderMonitor()
   elseif cmd == "exit" or cmd == "quit" or cmd == "ende" then
     state.running = false
     return false
@@ -1639,10 +2443,10 @@ end
 local function backgroundLoop()
   while state.running do
     local now = nowMs()
+    state.tick = state.tick + 1
 
     if (not state.snapshot) or (now - state.lastScan >= (state.config.scanInterval * 1000)) then
       scanAll(true)
-      renderMonitor()
     end
 
     if state.snapshot then
@@ -1653,10 +2457,10 @@ local function backgroundLoop()
           state.page = 1
         end
         state.lastPageSwitch = now
-        renderMonitor()
       end
     end
 
+    renderMonitor()
     sleep(1)
   end
 end
@@ -1665,6 +2469,7 @@ local function commandLoop()
   print("Lager Statistik gestartet.")
   print("Nur noch Lesen / Statistiken - keine Item-Bewegung mehr.")
   print("ME Bridge und Stromdaten werden automatisch erkannt, wenn vorhanden.")
+  print("Monitor auto waehlt jetzt den groessten gefundenen Monitor.")
   print("Mit 'help' bekommst du alle Befehle.")
   print("")
 
