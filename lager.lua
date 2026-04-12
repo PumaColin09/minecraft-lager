@@ -1,17 +1,11 @@
-local IO_NAME = nil
 local MONITOR_NAME = nil
 local MONITOR_SCALE = 0.5
-local SORT_INTERVAL = 1
-local SCAN_INTERVAL = 5
 local PAGE_INTERVAL = 4
+local SCAN_INTERVAL = 5
 local TOPOLOGY_REFRESH_INTERVAL = 10
-local OUTPUT_HOLD_SECONDS = 120
-local OUTPUT_FRACTION = 0.25
-local MIN_OUTPUT_SLOTS = 9
-local MAX_OUTPUT_SLOTS = 27
-local REBALANCE_BATCH_MOVES = 32
 local ROLE_MARKER_SLOT = 1
 local MAP_FILE = "mod_map.txt"
+local FINAL_LOCK_FILE = "lager_final_done.txt"
 
 local SPECIAL_TARGETS = {
   ores = nil,
@@ -26,12 +20,9 @@ local SPECIAL_TARGETS = {
   overflow = nil,
 }
 
-local AUTO_MOD_POOL = true
-local MOD_POOL_NAMES = {
-  -- "create:item_vault_0",
-  -- "create:item_vault_1",
-  -- "minecraft:chest_3",
-  -- "minecraft:chest_4",
+local SOURCE_CHEST_TYPES = {
+  ["minecraft:chest"] = true,
+  ["minecraft:trapped_chest"] = true,
 }
 
 local GROUP_LABELS = {
@@ -47,11 +38,10 @@ local GROUP_LABELS = {
 }
 
 local state = {
-  ioName = nil,
-  io = nil,
   monitor = nil,
   poolNames = {},
   storageNames = {},
+  sourceNames = {},
   modMap = {},
   pinnedTargets = {},
   overflowName = nil,
@@ -63,18 +53,15 @@ local state = {
   order = {},
   totalItems = 0,
   totalStacks = 0,
+  pendingSourceItems = 0,
+  pendingSourceStacks = 0,
   lastScan = 0,
   lastTopologyCheck = 0,
   topologySig = "",
   markerSig = "",
-  lastShownKeys = {},
-  lastShownQuery = "",
   dirty = true,
-  rebalancePending = false,
-  outputReservations = {},
+  migrationLocked = false,
 }
-
-local SIDE_ORDER = { "top", "bottom", "left", "right", "front", "back" }
 
 local function nowMs()
   return os.epoch("utc")
@@ -88,65 +75,6 @@ local function sortedNames()
   local names = peripheral.getNames()
   table.sort(names)
   return names
-end
-
-local function isInventory(name)
-  return name and peripheral.isPresent(name) and peripheral.hasType(name, "inventory")
-end
-
-local function invSize(inv)
-  if not inv or not inv.size then
-    return 0
-  end
-
-  local ok, value = pcall(inv.size)
-  if ok and value then
-    return value
-  end
-
-  return 0
-end
-
-local function invList(inv)
-  if not inv or not inv.list then
-    return {}
-  end
-
-  local ok, value = pcall(inv.list)
-  if ok and type(value) == "table" then
-    return value
-  end
-
-  return {}
-end
-
-local function invDetail(inv, slot)
-  if not inv or not inv.getItemDetail then
-    return nil
-  end
-
-  local ok, value = pcall(inv.getItemDetail, slot)
-  if ok then
-    return value
-  end
-
-  return nil
-end
-
-local function listPeripheralTypes(name)
-  local raw = { peripheral.getType(name) }
-  local out = {}
-  local seen = {}
-
-  for _, value in ipairs(raw) do
-    if value and value ~= "" and not seen[value] then
-      seen[value] = true
-      out[#out + 1] = tostring(value)
-    end
-  end
-
-  table.sort(out)
-  return out
 end
 
 local function joinList(values, sep)
@@ -201,41 +129,73 @@ local function clip(text, maxLen)
   return text:sub(1, maxLen - 1) .. ">"
 end
 
-local function outputSlotCount()
-  if not state.io then
+local function isInventory(name)
+  return name and peripheral.isPresent(name) and peripheral.hasType(name, "inventory")
+end
+
+local function invSize(inv)
+  if not inv or not inv.size then
     return 0
   end
 
-  local size = invSize(state.io)
-  if size <= 1 then
-    return 1
+  local ok, value = pcall(inv.size)
+  if ok and value then
+    return value
   end
 
-  local count = math.floor(size * OUTPUT_FRACTION + 0.5)
-  count = math.max(MIN_OUTPUT_SLOTS, math.min(MAX_OUTPUT_SLOTS, count))
+  return 0
+end
 
-  if count >= size then
-    count = math.max(1, math.floor(size / 2))
+local function invList(inv)
+  if not inv or not inv.list then
+    return {}
   end
 
-  return count
-end
-
-local function outputStart()
-  if not state.io then
-    return 1
+  local ok, value = pcall(inv.list)
+  if ok and type(value) == "table" then
+    return value
   end
 
-  local size = invSize(state.io)
-  return math.max(1, size - outputSlotCount() + 1)
+  return {}
 end
 
-local function inputEnd()
-  return math.max(0, outputStart() - 1)
+local function invDetail(inv, slot)
+  if not inv or not inv.getItemDetail then
+    return nil
+  end
+
+  local ok, value = pcall(inv.getItemDetail, slot)
+  if ok then
+    return value
+  end
+
+  return nil
 end
 
-local function entryKey(item)
-  return tostring(item.name) .. "#" .. tostring(item.nbt or "")
+local function hasAnyType(name, typeSet)
+  for typeName in pairs(typeSet or {}) do
+    if peripheral.hasType(name, typeName) then
+      return true
+    end
+  end
+
+  return false
+end
+
+local function listPeripheralTypes(name)
+  local raw = { peripheral.getType(name) }
+  local out = {}
+  local seen = {}
+
+  for _, value in ipairs(raw) do
+    if value and value ~= "" and not seen[value] then
+      seen[value] = true
+      out[#out + 1] = tostring(value)
+    end
+  end
+
+  table.sort(out)
+  return out
 end
 
 local function namespaceOf(itemName)
@@ -307,10 +267,6 @@ local function normalizeRouteKey(key)
 
   key = key:gsub("^%[", ""):gsub("%]$", "")
 
-  if key == "io" then
-    return "io"
-  end
-
   if key == "ignore" or key == "off" then
     return "ignore"
   end
@@ -352,23 +308,21 @@ local function parseMarkerText(text)
 
   local normalized = raw:upper():gsub("%s+", "")
   normalized = normalized:gsub("^%[", ""):gsub("%]$", "")
-
   if not normalized:find("^LAGER:") then
     return nil
   end
 
   local body = normalized:sub(7)
-
-  if body == "IO" then
-    return { kind = "io", label = "IO" }
-  end
-
   if body == "IGNORE" or body == "OFF" then
     return { kind = "ignore", label = "IGNORE" }
   end
 
   if body == "OVERFLOW" then
     return { kind = "overflow", label = "OVERFLOW", routeKey = "overflow" }
+  end
+
+  if body == "IO" then
+    return { kind = "io", label = "IO" }
   end
 
   local group = body:match("^GROUP:(.+)$") or body:match("^GRUPPE:(.+)$")
@@ -458,46 +412,11 @@ local function markerSignature()
   return table.concat(out, "|")
 end
 
-local function chooseIOName(markedIO)
-  if IO_NAME and isInventory(IO_NAME) then
-    return IO_NAME
-  end
-
-  if markedIO and isInventory(markedIO) then
-    return markedIO
-  end
-
-  if state.ioName and isInventory(state.ioName) then
-    return state.ioName
-  end
-
-  for _, side in ipairs(SIDE_ORDER) do
-    if isInventory(side) then
-      return side
-    end
-  end
-
-  for _, name in ipairs(sortedNames()) do
-    if isInventory(name) and peripheral.hasType(name, "minecraft:chest") then
-      return name
-    end
-  end
-
-  for _, name in ipairs(sortedNames()) do
-    if isInventory(name) then
-      return name
-    end
-  end
-
-  return nil
-end
-
 local function getMonitor()
   if MONITOR_NAME and MONITOR_NAME ~= "" then
     if peripheral.isPresent(MONITOR_NAME) and peripheral.hasType(MONITOR_NAME, "monitor") then
       return peripheral.wrap(MONITOR_NAME)
     end
-
     return nil
   end
 
@@ -897,6 +816,10 @@ local function entryLabel(entry)
   return entry.displayName
 end
 
+local function entryKey(item)
+  return tostring(item.name) .. "#" .. tostring(item.nbt or "")
+end
+
 local function buildConfiguredTargets()
   local pinned = {}
   local overflowName = nil
@@ -918,38 +841,12 @@ local function isMarkerSlot(invName, slot)
   return slot == ROLE_MARKER_SLOT and state.markers[invName] ~= nil
 end
 
-local function cleanupOutputReservations()
-  if not state.io then
-    state.outputReservations = {}
-    return
-  end
-
-  local now = nowMs()
-
-  for slot, expiresAt in pairs(state.outputReservations) do
-    if expiresAt <= now or not invDetail(state.io, slot) then
-      state.outputReservations[slot] = nil
-    end
-  end
-end
-
-local function reserveOutputSlot(slot)
-  state.outputReservations[slot] = nowMs() + (OUTPUT_HOLD_SECONDS * 1000)
-end
-
-local function isReservedOutputSlot(slot)
-  local expiresAt = state.outputReservations[slot]
-  if not expiresAt then
+local function chooseSourceRole(name, marker)
+  if not hasAnyType(name, SOURCE_CHEST_TYPES) then
     return false
   end
 
-  if not state.io then
-    state.outputReservations[slot] = nil
-    return false
-  end
-
-  if expiresAt <= nowMs() or not invDetail(state.io, slot) then
-    state.outputReservations[slot] = nil
+  if marker and (marker.kind == "route" or marker.kind == "overflow") then
     return false
   end
 
@@ -957,12 +854,12 @@ local function isReservedOutputSlot(slot)
 end
 
 local function refreshTopology()
-  local oldIOName = state.ioName
   local configuredPinned, configuredOverflow = buildConfiguredTargets()
   local markers = {}
   local ignored = {}
-  local markedIO = nil
   local candidates = {}
+  local sourceNames = {}
+  local storageNames = {}
   local markerRouteOwner = {}
   local overflowMarkerOwner = nil
 
@@ -980,13 +877,7 @@ local function refreshTopology()
         markers[name] = marker
         info.marker = marker
 
-        if marker.kind == "io" then
-          if not markedIO then
-            markedIO = name
-          else
-            info.note = "zweiter IO-Marker ignoriert"
-          end
-        elseif marker.kind == "ignore" then
+        if marker.kind == "ignore" then
           ignored[name] = true
         elseif marker.kind == "overflow" then
           if not overflowMarkerOwner then
@@ -1002,6 +893,8 @@ local function refreshTopology()
           else
             info.note = "zweiter Gruppen-/Mod-Marker ignoriert"
           end
+        elseif marker.kind == "io" then
+          info.note = "IO-Marker hat in diesem Skript keine Funktion"
         end
       end
 
@@ -1009,16 +902,6 @@ local function refreshTopology()
     end
   end
 
-  state.ioName = chooseIOName(markedIO)
-  if not state.ioName then
-    error("Keine I/O-Kiste gefunden.\nSetz IO_NAME oder nutze einen Marker in Slot 1: LAGER:IO", 0)
-  end
-
-  if not isInventory(state.ioName) then
-    error("IO_NAME ist kein Inventar: " .. tostring(state.ioName), 0)
-  end
-
-  state.io = peripheral.wrap(state.ioName)
   state.monitor = getMonitor()
   if state.monitor then
     state.monitor.setTextScale(MONITOR_SCALE)
@@ -1031,58 +914,32 @@ local function refreshTopology()
   state.pinnedTargets = configuredPinned
   state.overflowName = configuredOverflow
 
-  local reservedPool = {}
-  reservedPool[state.ioName] = true
-  if state.overflowName and isInventory(state.overflowName) then
-    reservedPool[state.overflowName] = true
-  end
+  for _, info in ipairs(candidates) do
+    local name = info.name
+    local marker = state.markers[name]
 
-  for _, invName in pairs(state.pinnedTargets) do
-    if invName and isInventory(invName) then
-      reservedPool[invName] = true
-    end
-  end
-
-  for invName in pairs(state.ignoredNames) do
-    reservedPool[invName] = true
-  end
-
-  local poolNames = {}
-  if AUTO_MOD_POOL then
-    for _, name in ipairs(sortedNames()) do
-      if isInventory(name) and not reservedPool[name] then
-        poolNames[#poolNames + 1] = name
-      end
-    end
-  else
-    for _, name in ipairs(MOD_POOL_NAMES) do
-      if isInventory(name) and not reservedPool[name] then
-        poolNames[#poolNames + 1] = name
-      end
-    end
-  end
-  table.sort(poolNames)
-  state.poolNames = uniqueList(poolNames)
-
-  local storageNames = {}
-  for _, name in ipairs(sortedNames()) do
-    if isInventory(name) and name ~= state.ioName and not state.ignoredNames[name] then
+    if state.ignoredNames[name] then
+      info.role = "Ignoriert"
+    elseif chooseSourceRole(name, marker) then
+      sourceNames[#sourceNames + 1] = name
+      info.role = "Quelle (Minecraft-Kiste)"
+    else
       storageNames[#storageNames + 1] = name
+      info.role = "Lager"
     end
   end
+
+  table.sort(sourceNames)
   table.sort(storageNames)
+  state.sourceNames = uniqueList(sourceNames)
   state.storageNames = uniqueList(storageNames)
 
   if #state.storageNames == 0 then
-    error("Keine Lager-Inventare gefunden.\nMarkiere Kisten mit LAGER:IGNORE, falls fremde Inventare stoeren.", 0)
+    error("Keine Ziel-Inventare gefunden.\nMarkiere fremde Inventare mit LAGER:IGNORE oder haenge modded Lagerkisten an.", 0)
   end
 
-  local validPool = {}
   local validStorage = {}
   local used = {}
-  for _, name in ipairs(state.poolNames) do
-    validPool[name] = true
-  end
   for _, name in ipairs(state.storageNames) do
     validStorage[name] = true
   end
@@ -1106,7 +963,7 @@ local function refreshTopology()
     if routeKey
       and routeKey ~= "overflow"
       and not cleanMap[routeKey]
-      and validPool[invName]
+      and validStorage[invName]
       and not used[invName]
     then
       cleanMap[routeKey] = invName
@@ -1116,9 +973,12 @@ local function refreshTopology()
 
   state.modMap = cleanMap
   state.freePool = {}
-  for _, name in ipairs(state.poolNames) do
+  state.poolNames = {}
+
+  for _, name in ipairs(state.storageNames) do
     if not used[name] then
       state.freePool[#state.freePool + 1] = name
+      state.poolNames[#state.poolNames + 1] = name
     end
   end
 
@@ -1130,33 +990,24 @@ local function refreshTopology()
   end
 
   for _, info in ipairs(candidates) do
-    if info.name == state.ioName then
-      info.role = "I/O"
-    elseif state.ignoredNames[info.name] then
-      info.role = "Ignoriert"
-    elseif state.overflowName and info.name == state.overflowName then
-      info.role = "Overflow"
-    elseif pinnedByInv[info.name] then
-      info.role = routeLabel(pinnedByInv[info.name])
-    elseif validPool[info.name] then
-      info.role = "Auto-Pool"
-    elseif validStorage[info.name] then
-      info.role = "Lager"
-    else
-      info.role = "-"
+    if info.role ~= "Quelle (Minecraft-Kiste)" and info.role ~= "Ignoriert" then
+      if state.overflowName and info.name == state.overflowName then
+        info.role = "Overflow"
+      elseif pinnedByInv[info.name] then
+        info.role = routeLabel(pinnedByInv[info.name])
+      elseif validStorage[info.name] then
+        info.role = "Lager"
+      else
+        info.role = "-"
+      end
     end
   end
+
   state.candidateInventories = candidates
-
-  if oldIOName ~= state.ioName then
-    state.outputReservations = {}
-  end
-
   saveMap()
   state.topologySig = inventorySignature()
   state.markerSig = markerSignature()
   state.lastTopologyCheck = nowMs()
-  state.rebalancePending = true
   state.dirty = true
 end
 
@@ -1272,8 +1123,26 @@ local function scanStorage()
   state.order = order
   state.totalItems = totalItems
   state.totalStacks = totalStacks
-  state.lastScan = nowMs()
-  state.dirty = false
+end
+
+local function scanSources()
+  local pendingItems = 0
+  local pendingStacks = 0
+
+  for _, invName in ipairs(state.sourceNames) do
+    local inv = peripheral.wrap(invName)
+    if inv then
+      for slot, item in pairs(invList(inv)) do
+        if not isMarkerSlot(invName, slot) then
+          pendingStacks = pendingStacks + 1
+          pendingItems = pendingItems + item.count
+        end
+      end
+    end
+  end
+
+  state.pendingSourceItems = pendingItems
+  state.pendingSourceStacks = pendingStacks
 end
 
 local function ensureFresh(force)
@@ -1281,6 +1150,9 @@ local function ensureFresh(force)
 
   if force or topologyChanged or state.dirty or (nowMs() - state.lastScan) >= (SCAN_INTERVAL * 1000) then
     scanStorage()
+    scanSources()
+    state.lastScan = nowMs()
+    state.dirty = false
   end
 end
 
@@ -1301,19 +1173,6 @@ local function pushItemsSafe(fromInv, targetName, fromSlot, amount, toSlot)
   end
 
   return 0
-end
-
-local function pushFromIO(targetName, fromSlot, toSlot)
-  if not targetName or targetName == state.ioName or not isInventory(targetName) then
-    return 0
-  end
-
-  local current = invDetail(state.io, fromSlot)
-  if not current then
-    return 0
-  end
-
-  return pushItemsSafe(state.io, targetName, fromSlot, current.count, toSlot)
 end
 
 local function pushBetweenInventories(fromInvName, targetName, fromSlot, amount, toSlot)
@@ -1338,36 +1197,15 @@ local function pushBetweenInventories(fromInvName, targetName, fromSlot, amount,
   return pushItemsSafe(fromInv, targetName, fromSlot, amount or detail.count, toSlot)
 end
 
-local function moveIntoKnownStacks(fromSlot, item)
-  local entry = state.index[entryKey(item)]
-  if not entry then
-    return 0
-  end
-
+local function moveIntoAnyStorage(fromInvName, fromSlot, attemptedInventories)
   local moved = 0
 
-  for _, loc in ipairs(entry.locs) do
-    if not invDetail(state.io, fromSlot) then
-      break
-    end
-
-    if loc.inv ~= state.ioName and isInventory(loc.inv) then
-      moved = moved + pushFromIO(loc.inv, fromSlot, loc.slot)
-    end
-  end
-
-  return moved
-end
-
-local function moveIntoAnyStorage(fromSlot, attemptedInventories)
-  local moved = 0
-
-  for _, invName in ipairs(state.poolNames) do
-    if invName ~= state.ioName and isInventory(invName) and not attemptedInventories[invName] then
+  for _, invName in ipairs(state.storageNames) do
+    if invName ~= fromInvName and isInventory(invName) and not attemptedInventories[invName] then
       attemptedInventories[invName] = true
-      moved = moved + pushFromIO(invName, fromSlot)
+      moved = moved + pushBetweenInventories(fromInvName, invName, fromSlot)
 
-      if not invDetail(state.io, fromSlot) then
+      if not invDetail(peripheral.wrap(fromInvName), fromSlot) then
         break
       end
     end
@@ -1376,140 +1214,116 @@ local function moveIntoAnyStorage(fromSlot, attemptedInventories)
   return moved
 end
 
-local function sortInput()
-  ensureFresh(false)
-  cleanupOutputReservations()
-
-  local movedAny = false
-  local size = invSize(state.io)
-
-  for slot = 1, size do
-    if not isReservedOutputSlot(slot) and not isMarkerSlot(state.ioName, slot) then
-      while true do
-        local item = invDetail(state.io, slot)
-        if not item then
-          break
-        end
-
-        local moved = 0
-        moved = moved + moveIntoKnownStacks(slot, item)
-
-        local attemptedInventories = {}
-
-        if invDetail(state.io, slot) then
-          local target = chooseTargetForItem(item)
-          if target and not attemptedInventories[target] then
-            attemptedInventories[target] = true
-            moved = moved + pushFromIO(target, slot)
-          end
-        end
-
-        if invDetail(state.io, slot)
-          and state.overflowName
-          and isInventory(state.overflowName)
-          and not attemptedInventories[state.overflowName]
-        then
-          attemptedInventories[state.overflowName] = true
-          moved = moved + pushFromIO(state.overflowName, slot)
-        end
-
-        if invDetail(state.io, slot) then
-          moved = moved + moveIntoAnyStorage(slot, attemptedInventories)
-        end
-
-        if moved == 0 then
-          break
-        end
-
-        movedAny = true
-        state.dirty = true
-      end
-    end
+local function moveSlotFromSource(fromInvName, fromSlot)
+  local fromInv = peripheral.wrap(fromInvName)
+  if not fromInv then
+    return 0
   end
 
-  if movedAny then
+  local detail = invDetail(fromInv, fromSlot)
+  if not detail or isMarkerSlot(fromInvName, fromSlot) then
+    return 0
+  end
+
+  local moved = 0
+  local attemptedInventories = {}
+
+  local targetName = select(1, chooseTargetForItem(detail))
+  if targetName and targetName ~= fromInvName then
+    attemptedInventories[targetName] = true
+    moved = moved + pushBetweenInventories(fromInvName, targetName, fromSlot, detail.count)
+  end
+
+  if invDetail(fromInv, fromSlot) then
+    moved = moved + moveIntoAnyStorage(fromInvName, fromSlot, attemptedInventories)
+  end
+
+  if invDetail(fromInv, fromSlot)
+    and state.overflowName
+    and state.overflowName ~= fromInvName
+    and not attemptedInventories[state.overflowName]
+  then
+    attemptedInventories[state.overflowName] = true
+    moved = moved + pushBetweenInventories(fromInvName, state.overflowName, fromSlot)
+  end
+
+  if moved > 0 then
     state.dirty = true
   end
+
+  return moved
 end
 
-local function rebalanceBatch(maxMoves)
-  ensureFresh(false)
+local function lockMigration()
+  local h = fs.open(FINAL_LOCK_FILE, "w")
+  if h then
+    h.writeLine("Migration abgeschlossen")
+    h.writeLine(textutils.formatTime(os.time(), true))
+    h.close()
+  end
+  state.migrationLocked = true
+end
+
+local function loadMigrationLock()
+  state.migrationLocked = fs.exists(FINAL_LOCK_FILE)
+end
+
+local function finalMigrate()
+  ensureFresh(true)
+
+  if state.migrationLocked then
+    print("Migration ist bereits abgeschlossen und gesperrt.")
+    print("Nur Statistik-Modus aktiv.")
+    return
+  end
+
+  if #state.sourceNames == 0 then
+    print("Keine Standard-Minecraft-Kisten als Quelle gefunden.")
+    return
+  end
 
   local movedStacks = 0
   local movedItems = 0
 
-  for _, invName in ipairs(state.storageNames) do
-    if movedStacks >= maxMoves then
-      break
-    end
+  print("Letzte Umlagerung startet...")
 
+  for _, invName in ipairs(state.sourceNames) do
     local inv = peripheral.wrap(invName)
     if inv then
-      for slot, item in pairs(invList(inv)) do
-        if movedStacks >= maxMoves then
-          break
-        end
-
+      for slot = 1, invSize(inv) do
         if not isMarkerSlot(invName, slot) then
-          local detail = invDetail(inv, slot)
-          if detail then
-            local targetName = chooseTargetForItem(detail)
-            if targetName and targetName ~= invName then
-              local sent = pushBetweenInventories(invName, targetName, slot, detail.count)
-
-              if sent == 0
-                and state.overflowName
-                and state.overflowName ~= invName
-                and targetName ~= state.overflowName
-              then
-                sent = pushBetweenInventories(invName, state.overflowName, slot, detail.count)
-              end
-
-              if sent > 0 then
-                movedStacks = movedStacks + 1
-                movedItems = movedItems + sent
-                state.dirty = true
-              end
+          while true do
+            local before = invDetail(inv, slot)
+            if not before then
+              break
             end
+
+            local sent = moveSlotFromSource(invName, slot)
+            if sent <= 0 then
+              break
+            end
+
+            movedStacks = movedStacks + 1
+            movedItems = movedItems + sent
+            sleep(0)
           end
         end
       end
     end
   end
 
-  if movedStacks == 0 then
-    state.rebalancePending = false
+  ensureFresh(true)
+
+  print(("Umlagerung fertig: %d Bewegungen / %s Items"):format(movedStacks, formatCount(movedItems)))
+
+  if state.pendingSourceItems == 0 then
+    lockMigration()
+    print("Alle Standard-Minecraft-Kisten sind leer.")
+    print("Ab jetzt ist nur noch Statistik-Modus aktiv.")
+  else
+    print(("Noch offen in Quellkisten: %s Items in %d Stacks"):format(formatCount(state.pendingSourceItems), state.pendingSourceStacks))
+    print("Es fehlt wahrscheinlich Platz im Ziel-Lager oder ein Inventar sollte mit LAGER:IGNORE markiert werden.")
   end
-
-  return movedStacks, movedItems
-end
-
-local function moveIntoOutput(fromInvName, fromSlot, amount)
-  local inv = peripheral.wrap(fromInvName)
-  if not inv then
-    return 0
-  end
-
-  cleanupOutputReservations()
-
-  local moved = 0
-  local size = invSize(state.io)
-  for toSlot = outputStart(), size do
-    local remaining = amount - moved
-    if remaining <= 0 then
-      break
-    end
-
-    if not isReservedOutputSlot(toSlot) and not isMarkerSlot(state.ioName, toSlot) then
-      local sent = pushItemsSafe(inv, state.ioName, fromSlot, remaining, toSlot)
-      if sent > 0 then
-        moved = moved + sent
-        reserveOutputSlot(toSlot)
-      end
-    end
-  end
-
-  return moved
 end
 
 local function rememberShown(entries, query)
@@ -1519,26 +1333,6 @@ local function rememberShown(entries, query)
   for i, entry in ipairs(entries or {}) do
     state.lastShownKeys[i] = entry.key
   end
-end
-
-local function entryFromReference(ref)
-  ref = trim(ref)
-  if ref:sub(1, 1) ~= "#" then
-    return nil
-  end
-
-  local idx = tonumber(ref:sub(2))
-  if not idx then
-    return nil
-  end
-
-  ensureFresh(false)
-  local key = state.lastShownKeys[idx]
-  if not key then
-    return nil
-  end
-
-  return state.index[key]
 end
 
 local function findMatches(query)
@@ -1607,89 +1401,11 @@ local function printEntries(entries, maxLines)
 
   for i = 1, math.min(#entries, maxLines) do
     local e = entries[i]
-    print(('%2d) %s x%s'):format(i, entryLabel(e), formatCount(e.count)))
+    print(("%2d) %s x%s"):format(i, entryLabel(e), formatCount(e.count)))
   end
 
   if #entries > maxLines then
-    print(('... %d weitere Treffer'):format(#entries - maxLines))
-  end
-end
-
-local function chooseMatch(matches)
-  if #matches == 1 then
-    return matches[1]
-  end
-
-  if #matches > 30 then
-    print("Zu viele Treffer. Bitte Suchbegriff verfeinern.")
-    rememberShown(matches, "")
-    printEntries(matches, 30)
-    return nil
-  end
-
-  rememberShown(matches, "")
-  print("Mehrdeutig.")
-  print("Waehle die passende Nummer:")
-  printEntries(matches, #matches)
-
-  while true do
-    write(("Auswahl 1-%d (leer = abbrechen): "):format(#matches))
-    local line = read()
-
-    if not line or line == "" then
-      return nil
-    end
-
-    local idx = tonumber(line)
-    if idx and matches[idx] then
-      return matches[idx]
-    end
-
-    print("Bitte eine gueltige Nummer eingeben.")
-  end
-end
-
-local function withdraw(query, amount)
-  ensureFresh(true)
-
-  local entry = entryFromReference(query)
-  if not entry then
-    local matches = findMatches(query)
-    if #matches == 0 then
-      print("Nichts gefunden: " .. tostring(query))
-      return
-    end
-
-    entry = chooseMatch(matches)
-    if not entry then
-      print("Abgebrochen.")
-      return
-    end
-  end
-
-  local remaining = amount
-  for _, loc in ipairs(entry.locs) do
-    if remaining <= 0 then
-      break
-    end
-
-    local moved = moveIntoOutput(loc.inv, loc.slot, remaining)
-    remaining = remaining - moved
-  end
-
-  local movedTotal = amount - remaining
-  if movedTotal > 0 then
-    state.dirty = true
-    ensureFresh(true)
-  end
-
-  print(("Ausgegeben: %d x %s"):format(movedTotal, entry.displayName))
-  if entry.desc and entry.desc ~= "" then
-    print("Variante: " .. entry.desc)
-  end
-
-  if remaining > 0 then
-    print(("Nicht mehr vorhanden oder Ausgabebereich belegt: %d"):format(remaining))
+    print(("... %d weitere Treffer"):format(#entries - maxLines))
   end
 end
 
@@ -1754,7 +1470,6 @@ local function listItems(filter)
     print("")
     print("Suche: list <suchwort>")
     print("Nach Mod/Gruppe: list @create oder list @stone")
-    print("Danach: hole #<nummer> [anzahl]")
     return
   end
 
@@ -1767,18 +1482,11 @@ local function listItems(filter)
   rememberShown(hits, filter)
   print(("Treffer fuer '%s': %d"):format(filter, #hits))
   printEntries(hits, 20)
-  print("Danach geht direkt: hole #<nummer> [anzahl]")
 end
 
 local function listAssignments()
   ensureFresh(false)
 
-  print("I/O: " .. tostring(state.ioName))
-  print("Marker-Slot: " .. ROLE_MARKER_SLOT .. " (z. B. LAGER:IO)")
-  print("Input-Bereich: 1-" .. inputEnd())
-  print("Output-Bereich: " .. outputStart() .. "-" .. invSize(state.io))
-  print("Ausgabe-Schutz: " .. OUTPUT_HOLD_SECONDS .. "s")
-  print("")
   print("Zuordnung:")
 
   local rows = {}
@@ -1809,11 +1517,12 @@ local function listAssignments()
   end
 
   print("")
-  print("Freie Auto-Kisten: " .. #state.freePool)
+  print("Freie Auto-Ziele: " .. #state.poolNames)
 end
 
 local function listInventories()
   ensureTopology(true)
+  ensureFresh(false)
 
   print("Inventare:")
   for _, info in ipairs(state.candidateInventories) do
@@ -1835,7 +1544,6 @@ local function listInventories()
 
   print("")
   print("Marker in Slot " .. ROLE_MARKER_SLOT .. ":")
-  print(" LAGER:IO")
   print(" LAGER:GROUP:stone")
   print(" LAGER:MOD:create")
   print(" LAGER:OVERFLOW")
@@ -1845,13 +1553,13 @@ end
 local function printStatus()
   ensureFresh(false)
 
-  print("I/O-Kiste: " .. tostring(state.ioName))
-  print("Lager-Inventare: " .. tostring(#state.storageNames))
-  print("Auto-Pool: " .. tostring(#state.poolNames))
+  print("Modus: Statistik + letzte Umlagerung")
   print("Monitor: " .. (state.monitor and "ja" or "nein"))
-  print("Output-Slots: " .. outputStart() .. "-" .. invSize(state.io))
-  print("Umsortierung: " .. (state.rebalancePending and "aktiv" or "ruhig"))
-  print("Typen: " .. tostring(#state.order) .. " | Items: " .. formatCount(state.totalItems))
+  print("Ziel-Inventare: " .. tostring(#state.storageNames))
+  print("Quell-Minecraft-Kisten: " .. tostring(#state.sourceNames))
+  print("Ziel-Typen: " .. tostring(#state.order) .. " | Ziel-Items: " .. formatCount(state.totalItems))
+  print("Offen in Quellkisten: " .. formatCount(state.pendingSourceItems) .. " Items in " .. tostring(state.pendingSourceStacks) .. " Stacks")
+  print("Migration gesperrt: " .. (state.migrationLocked and "ja" or "nein"))
 end
 
 local function redrawMonitor(page)
@@ -1861,7 +1569,8 @@ local function redrawMonitor(page)
   end
 
   local w, h = m.getSize()
-  local lines = math.max(1, h - 2)
+  local headerLines = math.min(2, h)
+  local lines = math.max(1, h - headerLines)
   local pages = math.max(1, math.ceil(#state.order / lines))
 
   if page > pages then
@@ -1872,12 +1581,24 @@ local function redrawMonitor(page)
   m.clear()
   m.setTextColor(colors.yellow)
   m.setCursorPos(1, 1)
-  m.write(clip(("Lager %d/%d %d Typen %s Items"):format(page, pages, #state.order, formatCount(state.totalItems)), w))
+  m.write(clip(("Lager %d/%d | %d Typen | %s Items"):format(page, pages, #state.order, formatCount(state.totalItems)), w))
+
+  if h >= 2 then
+    m.setCursorPos(1, 2)
+    if state.pendingSourceItems > 0 then
+      m.setTextColor(colors.orange)
+      m.write(clip(("Quellkisten offen: %s"):format(formatCount(state.pendingSourceItems)), w))
+    else
+      m.setTextColor(colors.lime)
+      local text = state.migrationLocked and "Migration abgeschlossen" or "Quellkisten leer"
+      m.write(clip(text, w))
+    end
+  end
 
   local startIndex = (page - 1) * lines + 1
   for row = 1, lines do
     local entry = state.order[startIndex + row - 1]
-    local y = row + 1
+    local y = row + headerLines
 
     if y > h then
       break
@@ -1933,113 +1654,27 @@ local function monitorLoop()
   end
 end
 
-local function fullRebalance()
-  ensureTopology(true)
-  ensureFresh(true)
-
-  local totalStacks = 0
-  local totalItems = 0
-  local loops = 0
-
-  state.rebalancePending = true
-
-  while true do
-    local movedStacks, movedItems = rebalanceBatch(REBALANCE_BATCH_MOVES)
-    totalStacks = totalStacks + movedStacks
-    totalItems = totalItems + movedItems
-    loops = loops + 1
-
-    if movedStacks == 0 then
-      break
-    end
-
-    ensureFresh(true)
-
-    if loops > 5000 then
-      break
-    end
-
-    sleep(0)
-  end
-
-  ensureFresh(true)
-  return totalStacks, totalItems
-end
-
-local function sorterLoop()
-  while true do
-    sortInput()
-
-    if state.rebalancePending then
-      local movedStacks = select(1, rebalanceBatch(REBALANCE_BATCH_MOVES))
-      if movedStacks > 0 then
-        ensureFresh(true)
-      end
-    end
-
-    sleep(SORT_INTERVAL)
-  end
-end
-
-local function fullScan(doRebalance)
-  ensureTopology(true)
-  sortInput()
-
-  local movedStacks = 0
-  local movedItems = 0
-  if doRebalance then
-    movedStacks, movedItems = fullRebalance()
-  end
-
-  ensureFresh(true)
-  return movedStacks, movedItems
-end
-
-local function parseQueryAndAmount(args, startIndex)
-  if #args < startIndex then
-    return "", 1
-  end
-
-  local last = #args
-  local amount = tonumber(args[#args])
-  if amount then
-    last = #args - 1
-  else
-    amount = 1
-  end
-
-  if amount < 1 then
-    amount = 1
-  end
-
-  return table.concat(args, " ", startIndex, last), amount
-end
-
 local function printHelp()
   print("Befehle:")
   print(" hilfe")
   print(" status")
-  print(" zuordnung")
   print(" inventare")
+  print(" zuordnung")
   print(" gruppen")
   print(" list [filter]")
-  print(" hole <name>|#<nummer> [anzahl]")
   print(" scan")
-  print(" umsortieren")
-  print(" neu")
+  print(" umlagern")
   print(" stop")
   print("")
-  print("Marker in Slot " .. ROLE_MARKER_SLOT .. ":")
-  print(" LAGER:IO macht genau diese Kiste zur I/O-Kiste.")
-  print(" LAGER:GROUP:stone oder LAGER:MOD:create pinnt eine Lagerkiste.")
-  print(" LAGER:OVERFLOW ist die Notfall-Kiste.")
-  print(" LAGER:IGNORE nimmt ein Inventar ganz aus dem System.")
+  print("Dieses Skript zieht Standard-Minecraft-Kisten nur noch einmal leer.")
+  print("Danach bleibt nur Statistik/Monitor aktiv.")
 end
 
 local function commandLoop()
   term.clear()
   term.setCursorPos(1, 1)
-  print("Lagersystem gestartet.")
+  print("Lager-Abschlussmodus gestartet.")
+  print("Standard-Minecraft-Kisten werden nur noch auf Wunsch geleert.")
   printStatus()
   print("")
   printHelp()
@@ -2061,31 +1696,20 @@ local function commandLoop()
       printHelp()
     elseif cmd == "status" then
       printStatus()
-    elseif cmd == "zuordnung" then
-      listAssignments()
     elseif cmd == "inventare" or cmd == "kisten" then
       listInventories()
+    elseif cmd == "zuordnung" then
+      listAssignments()
     elseif cmd == "gruppen" then
       printGroupOverview(50)
-    elseif cmd == "scan" then
-      local stacks, items = fullScan(true)
-      print(("Scan fertig. Neue Kisten uebernommen. Umsortiert: %d Stacks / %s Items"):format(stacks, formatCount(items)))
-    elseif cmd == "umsortieren" or cmd == "rebalance" then
-      local stacks, items = fullRebalance()
-      print(("Umsortiert: %d Stacks / %s Items"):format(stacks, formatCount(items)))
-    elseif cmd == "neu" then
-      local stacks, items = fullScan(true)
-      print(("Peripherie neu geladen. Umsortiert: %d Stacks / %s Items"):format(stacks, formatCount(items)))
-      printStatus()
     elseif cmd == "list" then
       listItems(table.concat(args, " ", 2))
-    elseif cmd == "hole" then
-      local query, amount = parseQueryAndAmount(args, 2)
-      if query == "" then
-        print("Benutzung: hole <name>|#<nummer> [anzahl]")
-      else
-        withdraw(query, amount)
-      end
+    elseif cmd == "scan" or cmd == "neu" then
+      ensureFresh(true)
+      print("Scan fertig.")
+      printStatus()
+    elseif cmd == "umlagern" or cmd == "migrieren" then
+      finalMigrate()
     elseif cmd == "stop" or cmd == "exit" then
       print("Programm beendet.")
       return
@@ -2096,12 +1720,11 @@ local function commandLoop()
 end
 
 loadMap()
+loadMigrationLock()
 refreshTopology()
 ensureFresh(true)
 
 parallel.waitForAny(
   commandLoop,
-  function()
-    parallel.waitForAll(sorterLoop, monitorLoop)
-  end
+  monitorLoop
 )
