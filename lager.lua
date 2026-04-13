@@ -20,7 +20,7 @@ local state = {
   lastSupportRun = 0,
   lastSupportMoved = 0,
   lastSupportMovedPriority = 0,
-  lastSupportMovedMe = 0,
+  lastSupportStayed = 0,
   lastSupportTouched = 0,
   lastSupportNote = "-",
   config = {
@@ -31,7 +31,7 @@ local state = {
     meBridgeDisabled = false,
     scanInterval = DEFAULT_SCAN_INTERVAL,
     pageInterval = DEFAULT_PAGE_INTERVAL,
-    ioName = nil,
+    vaultNames = nil,
     priorityName = nil,
     supportEnabled = true,
     supportInterval = DEFAULT_SUPPORT_INTERVAL,
@@ -333,8 +333,18 @@ local function loadConfig()
   if tonumber(data.pageInterval) then
     state.config.pageInterval = math.max(2, math.floor(tonumber(data.pageInterval)))
   end
-  if type(data.ioName) == "string" then
-    state.config.ioName = data.ioName
+  if type(data.vaultNames) == "table" then
+    local clean = {}
+    for _, name in ipairs(data.vaultNames) do
+      if type(name) == "string" and name ~= "" then
+        clean[#clean + 1] = name
+      end
+    end
+    if #clean > 0 then
+      state.config.vaultNames = clean
+    else
+      state.config.vaultNames = nil
+    end
   end
   if type(data.priorityName) == "string" then
     state.config.priorityName = data.priorityName
@@ -537,21 +547,72 @@ local function isPriorityControllerName(name)
   return false
 end
 
-local function resolveIoName()
-  if state.config.ioName and state.config.ioName ~= "" and peripheral.isPresent(state.config.ioName) and hasType(state.config.ioName, "inventory") then
-    return state.config.ioName
+local function isVaultName(name)
+  if not name or not peripheral.isPresent(name) or not hasType(name, "inventory") then
+    return false
+  end
+
+  if typesContain(name, "item_vault")
+    or typesContain(name, "itemvault")
+    or typesContain(name, "create:item_vault") then
+    return true
+  end
+
+  local lowerName = tostring(name or ""):lower()
+  if lowerName:find("item_vault", 1, true)
+    or lowerName:find("itemvault", 1, true)
+    or (lowerName:find("create", 1, true) and lowerName:find("vault", 1, true)) then
+    return true
+  end
+
+  return false
+end
+
+local function resolveVaultNames()
+  local out = {}
+  local seen = {}
+
+  local function add(name)
+    if not name or name == "" or seen[name] then
+      return
+    end
+    if peripheral.isPresent(name) and hasType(name, "inventory") then
+      seen[name] = true
+      out[#out + 1] = name
+    end
+  end
+
+  if type(state.config.vaultNames) == "table" and #state.config.vaultNames > 0 then
+    for _, name in ipairs(state.config.vaultNames) do
+      add(name)
+    end
+    table.sort(out)
+    return out
   end
 
   for _, name in ipairs(sortedNames()) do
     if hasType(name, "inventory") then
       local inv = safeWrap(name)
-      if inv and inventoryMarker(inv) == "IO" then
-        return name
+      local marker = inv and inventoryMarker(inv) or nil
+      if marker == "VAULT" or marker == "SOURCE" then
+        add(name)
       end
     end
   end
 
-  return nil
+  if #out > 0 then
+    table.sort(out)
+    return out
+  end
+
+  for _, name in ipairs(sortedNames()) do
+    if isVaultName(name) then
+      add(name)
+    end
+  end
+
+  table.sort(out)
+  return out
 end
 
 local function resolvePriorityName()
@@ -578,34 +639,19 @@ local function resolvePriorityName()
   return nil
 end
 
-local function resolveOverflowName()
-  if state.config.overflowName and state.config.overflowName ~= "" and peripheral.isPresent(state.config.overflowName) and hasType(state.config.overflowName, "inventory") then
-    return state.config.overflowName
-  end
-
-  for _, name in ipairs(sortedNames()) do
-    if hasType(name, "inventory") then
-      local inv = safeWrap(name)
-      if inv and inventoryMarker(inv) == "OVERFLOW" then
-        return name
-      end
-    end
-  end
-
-  return nil
-end
-
 local function buildSupportStatus()
+  local vaultNames = resolveVaultNames()
   return {
     enabled = state.config.supportEnabled and true or false,
-    ioName = resolveIoName(),
+    vaultNames = vaultNames,
+    vaultCount = #vaultNames,
     priorityName = resolvePriorityName(),
     meBridgeName = resolveMeBridgeName(),
     interval = state.config.supportInterval,
     lastRun = state.lastSupportRun,
     lastMoved = state.lastSupportMoved,
     lastMovedPriority = state.lastSupportMovedPriority or 0,
-    lastMovedMe = state.lastSupportMovedMe or 0,
+    lastStayed = state.lastSupportStayed or 0,
     lastTouched = state.lastSupportTouched or 0,
     lastNote = state.lastSupportNote,
   }
@@ -686,48 +732,11 @@ local function buildBridgeFilter(detail, slot, count)
   return filter
 end
 
-local function moveSlotToMe(bridge, ioName, source, slot, detail)
-  if not bridge or not ioName or not source then
-    return 0
-  end
-
-  local before = slotCount(source, slot)
-  if before <= 0 then
-    return 0
-  end
-
-  local filter = buildBridgeFilter(detail, slot, before)
-  safeCall(bridge, "importItem", filter, ioName)
-  local after = slotCount(source, slot)
-  local moved = math.max(0, before - after)
-
-  if moved <= 0 and detail and detail.name and before > 0 then
-    safeCall(bridge, "importItem", {
-      name = detail.name,
-      count = before,
-      fromSlot = tonumber(slot),
-      type = "item",
-    }, ioName)
-    after = slotCount(source, slot)
-    moved = math.max(0, before - after)
-  end
-
-  return moved
-end
-
 local function runSupportMove(silent)
   local support = buildSupportStatus()
 
   if not support.enabled then
     state.lastSupportNote = "Sortierung aus"
-    return 0
-  end
-
-  if not support.ioName then
-    state.lastSupportNote = "Keine I/O gefunden"
-    if not silent then
-      print("Keine I/O-Kiste gefunden.")
-    end
     return 0
   end
 
@@ -739,19 +748,10 @@ local function runSupportMove(silent)
     return 0
   end
 
-  if support.ioName == support.priorityName then
-    state.lastSupportNote = "I/O und Controller identisch"
+  if not support.vaultNames or #support.vaultNames == 0 then
+    state.lastSupportNote = "Keine Vaults gefunden"
     if not silent then
-      print("I/O-Kiste und Controller duerfen nicht dasselbe Inventar sein.")
-    end
-    return 0
-  end
-
-  local io = safeWrap(support.ioName)
-  if not io or not hasMethod(io, "pushItems") then
-    state.lastSupportNote = "I/O kann nicht pushen"
-    if not silent then
-      print("I/O-Kiste unterstuetzt kein pushItems.")
+      print("Keine Create Item Vaults gefunden.")
     end
     return 0
   end
@@ -765,47 +765,51 @@ local function runSupportMove(silent)
     return 0
   end
 
-  local bridge = nil
-  if support.meBridgeName then
-    bridge = safeWrap(support.meBridgeName)
+  local prioritySet = buildPriorityItemSet(controller)
+  if not next(prioritySet) then
+    state.lastSupportRun = nowMs()
+    state.lastSupportMoved = 0
+    state.lastSupportMovedPriority = 0
+    state.lastSupportStayed = 0
+    state.lastSupportTouched = 0
+    state.lastSupportNote = "Controller ist leer"
+    if not silent then
+      print("Im Controller wurden noch keine priorisierten Items gefunden.")
+    end
+    return 0
   end
 
-  local prioritySet = buildPriorityItemSet(controller)
-  local list = safeCall(io, "list") or {}
   local movedTotal = 0
   local movedPriority = 0
-  local movedMe = 0
+  local stayed = 0
   local touched = 0
+  local checkedSources = 0
 
-  for _, slot in ipairs(sortedSlotKeys(list)) do
-    local basic = list[slot]
-    if basic and basic.name and tonumber(basic.count or 0) > 0 then
-      local detail = safeCall(io, "getItemDetail", slot) or basic
-      local isMarker = (slot == ROLE_MARKER_SLOT and parseMarker(detail) ~= nil)
-      if not isMarker then
-        local touchedSlot = false
-
-        if isPriorityItem(detail, prioritySet) then
-          local movedNow = safeNumber(safeCall(io, "pushItems", support.priorityName, slot)) or 0
-          if movedNow > 0 then
-            movedPriority = movedPriority + movedNow
-            movedTotal = movedTotal + movedNow
-            touchedSlot = true
+  for _, vaultName in ipairs(support.vaultNames) do
+    if vaultName ~= support.priorityName then
+      local vault = safeWrap(vaultName)
+      if vault and hasMethod(vault, "pushItems") then
+        checkedSources = checkedSources + 1
+        local list = safeCall(vault, "list") or {}
+        for _, slot in ipairs(sortedSlotKeys(list)) do
+          local basic = list[slot]
+          if basic and basic.name and tonumber(basic.count or 0) > 0 then
+            local detail = safeCall(vault, "getItemDetail", slot) or basic
+            local isMarker = (slot == ROLE_MARKER_SLOT and parseMarker(detail) ~= nil)
+            if not isMarker and isPriorityItem(detail, prioritySet) then
+              local before = slotCount(vault, slot)
+              local movedNow = safeNumber(safeCall(vault, "pushItems", support.priorityName, slot)) or 0
+              local after = slotCount(vault, slot)
+              if movedNow > 0 then
+                movedPriority = movedPriority + movedNow
+                movedTotal = movedTotal + movedNow
+                touched = touched + 1
+              end
+              if after > 0 and before > 0 then
+                stayed = stayed + after
+              end
+            end
           end
-        end
-
-        local remaining = slotCount(io, slot)
-        if remaining > 0 and bridge and hasMethod(bridge, "importItem") then
-          local movedNow = moveSlotToMe(bridge, support.ioName, io, slot, detail)
-          if movedNow > 0 then
-            movedMe = movedMe + movedNow
-            movedTotal = movedTotal + movedNow
-            touchedSlot = true
-          end
-        end
-
-        if touchedSlot then
-          touched = touched + 1
         end
       end
     end
@@ -814,24 +818,24 @@ local function runSupportMove(silent)
   state.lastSupportRun = nowMs()
   state.lastSupportMoved = movedTotal
   state.lastSupportMovedPriority = movedPriority
-  state.lastSupportMovedMe = movedMe
+  state.lastSupportStayed = stayed
   state.lastSupportTouched = touched
 
   if movedTotal > 0 then
-    state.lastSupportNote = "Controller " .. formatCount(movedPriority) .. " | ME " .. formatCount(movedMe)
+    state.lastSupportNote = "Controller " .. formatCount(movedPriority) .. " | In Vaults " .. formatCount(stayed)
     if not silent then
-      print("Sortiert: " .. formatCount(movedPriority) .. " -> Controller | " .. formatCount(movedMe) .. " -> ME (" .. tostring(touched) .. " Stapel)")
+      print("Sortiert: " .. formatCount(movedPriority) .. " -> Controller | in Vaults geblieben: " .. formatCount(stayed) .. " (" .. tostring(touched) .. " Stapel, " .. tostring(checkedSources) .. " Vaults)")
     end
   else
-    if bridge then
-      state.lastSupportNote = "Nichts bewegt"
+    if stayed > 0 then
+      state.lastSupportNote = "Controller voll / kein Platz"
       if not silent then
-        print("Nichts bewegt. I/O leer oder weder Controller noch ME konnten etwas annehmen.")
+        print("Nichts vollstaendig bewegt. Der Controller nimmt aktuell keine weiteren priorisierten Items auf.")
       end
     else
-      state.lastSupportNote = "ME Bridge fehlt"
+      state.lastSupportNote = "Nichts bewegt"
       if not silent then
-        print("Keine ME Bridge gefunden. Nur Controller-Priorisierung aktiv.")
+        print("Nichts bewegt. Entweder liegen keine priorisierten Items in den Vaults oder der Controller ist voll.")
       end
     end
   end
@@ -1429,6 +1433,7 @@ local function buildMonitorPages(snapshot)
     "Lokale Items: " .. formatCount(localStats.totalItems),
     "Lokale Typen: " .. formatCount(localStats.uniqueItems),
     "Sortierung: " .. (support.enabled and "AN" or "AUS"),
+    "Vaults: " .. formatCount(support.vaultCount or 0),
     "Controller: " .. (support.priorityName or "nicht gesetzt"),
     "ME Bridge: " .. (meStats.available and meStats.name or "nicht gefunden"),
     "ME Items: " .. formatCount(meStats.totalItems),
@@ -1461,16 +1466,18 @@ local function buildMonitorPages(snapshot)
   addPage(pages, "Lager", storageLines, "storage")
 
   local supportLines = {
-    "Modus: " .. (support.enabled and "Auto-Sortierung aktiv" or "nur Statistik"),
-    "I/O: " .. (support.ioName or "nicht gefunden"),
+    "Modus: " .. (support.enabled and "Vault -> Controller aktiv" or "nur Statistik"),
+    "Vaults: " .. formatCount(support.vaultCount or 0),
     "Controller: " .. (support.priorityName or "nicht gefunden"),
-    "ME Bridge: " .. (support.meBridgeName or "nicht gefunden"),
     "Intervall: " .. tostring(support.interval) .. "s",
     "Letzter Lauf: " .. formatSince(support.lastRun),
     "Zum Controller: " .. formatCount(support.lastMovedPriority or 0),
-    "Zur ME: " .. formatCount(support.lastMovedMe or 0),
+    "In Vaults: " .. formatCount(support.lastStayed or 0),
     "Info: " .. tostring(support.lastNote or "-"),
   }
+  for i = 1, math.min(2, #(support.vaultNames or {})) do
+    supportLines[#supportLines + 1] = "Quelle " .. tostring(i) .. ": " .. tostring(support.vaultNames[i])
+  end
   addPage(pages, "Support", supportLines, "support")
 
   local meLines = {}
@@ -2325,10 +2332,10 @@ local function showStatus()
   print("Kombi Items:      " .. formatCount(snapshot.combined.totalItems))
   print("Kombi Typen:      " .. formatCount(snapshot.combined.uniqueItems))
   print("Sortierung:       " .. ((snapshot.support and snapshot.support.enabled) and "AN" or "AUS"))
-  print("I/O Kiste:        " .. ((snapshot.support and snapshot.support.ioName) or "nicht gesetzt"))
+  print("Vaults:           " .. formatCount((snapshot.support and snapshot.support.vaultCount) or 0))
   print("Controller:       " .. ((snapshot.support and snapshot.support.priorityName) or "nicht gesetzt"))
   print("Zuletzt Ctrl:     " .. formatCount((snapshot.support and snapshot.support.lastMovedPriority) or 0))
-  print("Zuletzt ME:       " .. formatCount((snapshot.support and snapshot.support.lastMovedMe) or 0))
+  print("In Vaults:        " .. formatCount((snapshot.support and snapshot.support.lastStayed) or 0))
   print("Zuletzt bewegt:   " .. formatCount((snapshot.support and snapshot.support.lastMoved) or 0))
   print("Energie-Quellen:  " .. formatCount(#snapshot.energy.sources))
   print("Letzter Scan:     " .. formatSince(snapshot.time))
@@ -2603,25 +2610,26 @@ end
 
 local function showHelp()
   printSection("Auto-Sortierung + Statistik")
-  print("Dieses Script sortiert automatisch aus der I/O-Kiste.")
-  print("Items, die bereits im Functional-Storage-Controller liegen,")
-  print("gehen zuerst dort hinein. Alles andere geht in die ME.")
+  print("Dieses Script sortiert automatisch aus Create Item Vaults.")
+  print("Nur Items, die bereits im Functional-Storage-Controller liegen,")
+  print("werden dorthin verschoben. Ueberschuss bleibt in den Vaults.")
   print("")
-  print("Wenige wichtige Befehle:")
-  print("  help / hilfe             - Hilfe anzeigen")
-  print("  status                   - Uebersicht")
-  print("  scan                     - sofort neu scannen")
-  print("  sort                     - Sortierung sofort ausfuehren")
-  print("  periph                   - erkannte Peripherals")
-  print("  io [auto|<name>]         - I/O-Kiste setzen oder Marker nutzen")
-  print("  controller [auto|<name>] - Functional-Storage-Controller setzen")
-  print("  mebridge [auto|off|<name>] - ME Bridge setzen")
+  print("Wichtige Befehle:")
+  print("  help / hilfe               - Hilfe anzeigen")
+  print("  status                     - Uebersicht")
+  print("  scan                       - sofort neu scannen")
+  print("  sort                       - Sortierung sofort ausfuehren")
+  print("  periph                     - erkannte Peripherals")
+  print("  vaults [auto|<name> ...]   - Vaults automatisch oder fest setzen")
+  print("  controller [auto|<name>]   - Functional-Storage-Controller setzen")
+  print("  mebridge [auto|off|<name>] - ME Bridge nur fuer Statistik setzen")
   print("  monitor [auto|off|<name>]  - Monitor setzen")
-  print("  intervall <scan> [sort]  - Scan- und Sortierintervall")
-  print("  exit                     - Script beenden")
+  print("  intervall <scan> [sort]    - Scan- und Sortierintervall")
+  print("  exit                       - Script beenden")
   print("")
   print("Marker in Slot 1:")
-  print("  LAGER:IO")
+  print("  LAGER:VAULT")
+  print("  LAGER:SOURCE")
   print("  LAGER:PRIO")
   print("  LAGER:IGNORE")
 end
@@ -2630,41 +2638,59 @@ local function showSupportStatus()
   local support = buildSupportStatus()
   printSection("Auto-Sortierung")
   print("Modus:           " .. (support.enabled and "AN" or "AUS"))
-  print("I/O-Kiste:       " .. (support.ioName or "nicht gefunden"))
+  print("Vaults:          " .. formatCount(support.vaultCount or 0))
   print("Controller:      " .. (support.priorityName or "nicht gefunden"))
   print("ME Bridge:       " .. (support.meBridgeName or "nicht gefunden"))
   print("Intervall:       " .. tostring(support.interval) .. "s")
   print("Letzter Lauf:    " .. formatSince(support.lastRun))
   print("Zum Controller:  " .. formatCount(support.lastMovedPriority or 0))
-  print("Zur ME:          " .. formatCount(support.lastMovedMe or 0))
+  print("In Vaults:       " .. formatCount(support.lastStayed or 0))
   print("Zuletzt bewegt:  " .. formatCount(support.lastMoved))
   print("Hinweis:         " .. tostring(support.lastNote or "-"))
+  if support.vaultNames and #support.vaultNames > 0 then
+    print("Quellen:         " .. joinList(support.vaultNames, ", "))
+  end
 end
 
-local function handleIoCommand(args)
+local function handleVaultsCommand(args)
   if not args[2] then
-    print("I/O-Kiste: " .. (resolveIoName() or "nicht gefunden"))
+    local names = resolveVaultNames()
+    if #names == 0 then
+      print("Vaults: keine gefunden")
+    else
+      print("Vaults (" .. tostring(#names) .. "): " .. joinList(names, ", "))
+    end
     return
   end
 
   local sub = tostring(args[2]):lower()
-  if sub == "auto" then
-    state.config.ioName = nil
+  if sub == "auto" or sub == "clear" then
+    state.config.vaultNames = nil
     saveConfig()
     scanAll(true)
-    print("I/O-Kiste wird jetzt automatisch ueber LAGER:IO gesucht.")
+    print("Vaults werden jetzt automatisch gesucht.")
     return
   end
 
-  local name = args[2]
-  if peripheral.isPresent(name) and hasType(name, "inventory") then
-    state.config.ioName = name
-    saveConfig()
-    scanAll(true)
-    print("I/O-Kiste gesetzt auf " .. name)
-  else
-    print("Inventar '" .. tostring(name) .. "' nicht gefunden.")
+  local names = {}
+  for i = 2, #args do
+    local name = args[i]
+    if not (peripheral.isPresent(name) and hasType(name, "inventory")) then
+      print("Inventar '" .. tostring(name) .. "' nicht gefunden.")
+      return
+    end
+    names[#names + 1] = name
   end
+
+  if #names == 0 then
+    print("Bitte mindestens einen Vault-Namen angeben.")
+    return
+  end
+
+  state.config.vaultNames = names
+  saveConfig()
+  scanAll(true)
+  print("Vaults gesetzt auf: " .. joinList(names, ", "))
 end
 
 local function handlePriorityCommand(args)
@@ -2693,32 +2719,6 @@ local function handlePriorityCommand(args)
   end
 end
 
-local function handleOverflowCommand(args)
-  if not args[2] then
-    print("Overflow-Ziel: " .. (resolveOverflowName() or "-"))
-    return
-  end
-
-  local sub = tostring(args[2]):lower()
-  if sub == "off" then
-    state.config.overflowName = nil
-    saveConfig()
-    scanAll(true)
-    print("Overflow-Ziel deaktiviert.")
-    return
-  end
-
-  local name = args[2]
-  if peripheral.isPresent(name) and hasType(name, "inventory") then
-    state.config.overflowName = name
-    saveConfig()
-    scanAll(true)
-    print("Overflow-Ziel gesetzt auf " .. name)
-  else
-    print("Inventar '" .. tostring(name) .. "' nicht gefunden.")
-  end
-end
-
 local function handleSupportCommand(args)
   if not args[2] then
     showSupportStatus()
@@ -2731,7 +2731,7 @@ local function handleSupportCommand(args)
     saveConfig()
     scanAll(true)
     renderMonitor()
-    print("Support-Modus aktiviert.")
+    print("Auto-Sortierung aktiviert.")
     return
   end
 
@@ -2740,7 +2740,7 @@ local function handleSupportCommand(args)
     saveConfig()
     scanAll(true)
     renderMonitor()
-    print("Support-Modus deaktiviert.")
+    print("Auto-Sortierung deaktiviert.")
     return
   end
 
@@ -2762,7 +2762,7 @@ local function handleSupportCommand(args)
     state.config.supportInterval = math.max(1, math.floor(sec))
     saveConfig()
     scanAll(true)
-    print("Support-Intervall gesetzt auf " .. tostring(state.config.supportInterval) .. "s")
+    print("Sortier-Intervall gesetzt auf " .. tostring(state.config.supportInterval) .. "s")
     return
   end
 
@@ -2948,8 +2948,8 @@ local function handleCommand(line)
     end
   elseif cmd == "periph" or cmd == "peripherals" then
     showPeripherals()
-  elseif cmd == "io" then
-    handleIoCommand(args)
+  elseif cmd == "vaults" or cmd == "vault" or cmd == "quelle" or cmd == "quellen" then
+    handleVaultsCommand(args)
   elseif cmd == "controller" or cmd == "prio" then
     handlePriorityCommand(args)
   elseif cmd == "mebridge" then
@@ -3007,8 +3007,8 @@ end
 
 local function commandLoop()
   print("Lager Auto-Sortierung gestartet.")
-  print("I/O -> Controller zuerst, Rest -> ME System.")
-  print("ME Bridge, Controller und Monitor werden automatisch erkannt, wenn vorhanden.")
+  print("Vaults -> Controller fuer priorisierte Items. Ueberschuss bleibt in den Vaults.")
+  print("ME Bridge und Monitor dienen weiter fuer Statistik, wenn vorhanden.")
   print("Mit 'help' bekommst du die kurzen Befehle.")
   print("")
 
