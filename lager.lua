@@ -269,6 +269,9 @@ local function groupSpeakerIndexes(group)
   return idx
 end
 
+
+local MASTER_VOLUME = 1.5 -- skaliert alle Speaker-Noten hoch, CC:Tweaked playNote max 3.0
+
 local speakerGroups = {
   all = groupSpeakerIndexes("all"),
   a = groupSpeakerIndexes("a"),
@@ -278,9 +281,10 @@ local speakerGroups = {
 
 local function playGroup(group, instrument, volume, pitch)
   local list = speakerGroups[group] or speakerGroups.all
+  local loudness = clamp((tonumber(volume) or 1) * MASTER_VOLUME, 0, 3)
   for _, i in ipairs(list) do
     local sp = speakers[i]
-    pcall(function() sp.playNote(instrument, volume, clamp(pitch, 0, 24)) end)
+    pcall(function() sp.playNote(instrument, loudness, clamp(pitch, 0, 24)) end)
   end
 end
 
