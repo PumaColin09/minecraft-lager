@@ -13,12 +13,10 @@ local function safeWrap(name)
   return nil
 end
 
-local function collectNamesByType(t)
+local function namesByType(t)
   local out = {}
   for _, name in ipairs(peripheral.getNames()) do
-    if peripheral.getType(name) == t then
-      out[#out + 1] = name
-    end
+    if peripheral.getType(name) == t then out[#out + 1] = name end
   end
   table.sort(out)
   return out
@@ -31,15 +29,15 @@ local function sizeOf(mon)
   return tonumber(w) or 0, tonumber(h) or 0
 end
 
-local function setScale(mon, scale)
+local function setScale(mon, s)
   if not mon then return 0, 0 end
-  pcall(mon.setTextScale, scale)
+  pcall(mon.setTextScale, s)
   return sizeOf(mon)
 end
 
 local function discoverMonitors()
   local mons = {}
-  for _, name in ipairs(collectNamesByType("monitor")) do
+  for _, name in ipairs(namesByType("monitor")) do
     local mon = safeWrap(name)
     if mon then
       local w, h = setScale(mon, 0.5)
@@ -74,38 +72,29 @@ local function pickDisplays()
   local center = chosen[1]
   local sides = { chosen[2], chosen[3] }
   table.sort(sides, function(a, b) return a.name < b.name end)
-
-  return {
-    left = sides[1],
-    center = center,
-    right = sides[2],
-  }
+  return { left = sides[1], center = center, right = sides[2] }
 end
 
 local display = pickDisplays()
 if not display or not display.left or not display.center or not display.right then
-  error("Ich brauche 3 Monitore. Start: chrono_show_triple_megafix <links> <mitte> <rechts>")
+  error("Ich brauche 3 Monitore. Start: chrono_show_triple_party_fix2 <links> <mitte> <rechts>")
 end
 if not display.left.mon or not display.center.mon or not display.right.mon then
   error("Mindestens ein Monitorname ist ungueltig.")
 end
 
-local leftMon = display.left.mon
-local centerMon = display.center.mon
-local rightMon = display.right.mon
-local leftName = display.left.name
-local centerName = display.center.name
-local rightName = display.right.name
+local leftMon, centerMon, rightMon = display.left.mon, display.center.mon, display.right.mon
+local leftName, centerName, rightName = display.left.name, display.center.name, display.right.name
 
 local speakers = {}
-for _, name in ipairs(collectNamesByType("speaker")) do
+for _, name in ipairs(namesByType("speaker")) do
   local sp = safeWrap(name)
   if sp then speakers[#speakers + 1] = sp end
 end
 
 local function nowTable()
   local ok, t = pcall(function() return os.date("*t") end)
-  if ok and type(t) == "table" then return t end
+  if ok and type(t) == "table" and t.hour ~= nil then return t end
   local ingame = textutils.formatTime(os.time(), true) or "00:00"
   local hh, mm = ingame:match("^(%d+):(%d+)")
   return { hour = tonumber(hh) or 0, min = tonumber(mm) or 0, sec = 0 }
@@ -115,8 +104,8 @@ local function rect(mon, x1, y1, x2, y2, bg)
   local w, h = sizeOf(mon)
   if w < 1 or h < 1 then return end
   x1 = clamp(math.floor(x1), 1, w)
-  y1 = clamp(math.floor(y1), 1, h)
   x2 = clamp(math.floor(x2), 1, w)
+  y1 = clamp(math.floor(y1), 1, h)
   y2 = clamp(math.floor(y2), 1, h)
   if x2 < x1 then x1, x2 = x2, x1 end
   if y2 < y1 then y1, y2 = y2, y1 end
@@ -129,7 +118,7 @@ local function rect(mon, x1, y1, x2, y2, bg)
 end
 
 local function clear(mon, bg)
-  mon.setBackgroundColor(bg)
+  mon.setBackgroundColor(bg or colors.black)
   mon.setTextColor(colors.white)
   mon.clear()
   mon.setCursorPos(1, 1)
@@ -145,9 +134,7 @@ local function writeAt(mon, x, y, txt, fg, bg)
     x = 1
   end
   if x > w or txt == "" then return end
-  if x + #txt - 1 > w then
-    txt = txt:sub(1, w - x + 1)
-  end
+  if x + #txt - 1 > w then txt = txt:sub(1, w - x + 1) end
   if txt == "" then return end
   mon.setTextColor(fg or colors.white)
   mon.setBackgroundColor(bg or colors.black)
@@ -169,7 +156,7 @@ local function frameBox(mon, outer, inner)
   rect(mon, 1, h, w, h, outer)
   rect(mon, 1, 1, 1, h, outer)
   rect(mon, w, 1, w, h, outer)
-  if w >= 4 and h >= 4 then
+  if inner and w >= 4 and h >= 4 then
     rect(mon, 2, 2, w - 1, 2, inner)
     rect(mon, 2, h - 1, w - 1, h - 1, inner)
     rect(mon, 2, 2, 2, h - 1, inner)
@@ -182,34 +169,33 @@ local function progress(mon, y, ratio, onCol, offCol)
   if w < 4 then return end
   rect(mon, 3, y, w - 2, y, offCol)
   local fill = math.floor((w - 4) * clamp(ratio, 0, 1))
-  if fill > 0 then
-    rect(mon, 3, y, 2 + fill, y, onCol)
-  end
+  if fill > 0 then rect(mon, 3, y, 2 + fill, y, onCol) end
 end
 
-local function stripeBackground(mon, frame, c1, c2, c3)
-  local w, h = sizeOf(mon)
-  rect(mon, 1, 1, w, h, colors.black)
-  for y = 2, h - 1 do
-    local mod = (y + frame) % 6
-    local col = (mod == 0 or mod == 1) and c1 or ((mod == 2 or mod == 3) and c2 or c3)
-    rect(mon, 2, y, w - 1, y, col)
-  end
-end
-
-local function equalizer(mon, frame, baseY, height, palette)
-  local w, _ = sizeOf(mon)
-  local bars = math.max(6, math.floor((w - 4) / 3))
-  local gap = math.max(0, math.floor((w - 4 - bars) / math.max(1, bars - 1)))
+local function spectrum(mon, frame, baseY, height, palette)
+  local w = sizeOf(mon)
+  local bars = math.max(6, math.floor((w - 4) / 2))
   local x = 3
   for i = 1, bars do
-    local lvl = math.floor((math.sin((frame + i) * 0.55) + 1) * 0.5 * height)
+    local lvl = math.floor((math.sin((frame + i) * 0.55) + math.sin((frame + i * 2) * 0.21) + 2) * 0.25 * height)
     local col = palette[((i + frame) % #palette) + 1]
-    if lvl > 0 then
-      rect(mon, x, baseY - lvl + 1, x, baseY, col)
-    end
-    x = x + 1 + gap
+    if lvl > 0 then rect(mon, x, baseY - lvl + 1, x, baseY, col) end
+    x = x + 2
     if x > w - 2 then break end
+  end
+end
+
+local function movingBorder(mon, frame, palette)
+  local w, h = sizeOf(mon)
+  for x = 1, w do
+    local col = palette[((x + frame) % #palette) + 1]
+    rect(mon, x, 1, x, 1, col)
+    rect(mon, x, h, x, h, col)
+  end
+  for y = 1, h do
+    local col = palette[((y + frame) % #palette) + 1]
+    rect(mon, 1, y, 1, y, col)
+    rect(mon, w, y, w, y, col)
   end
 end
 
@@ -247,224 +233,226 @@ local function drawDigit(mon, x, y, w, h, ch, onCol, offCol)
   segment("c", rightX, midY + t, x + w - 1, bottomY - 1)
 end
 
-local function drawPair(mon, pair, onCol, offCol, title, foot, secRatio)
+local function drawPair(mon, pair, onCol, offCol, title, footer, secRatio, frame, pulseCol)
   setScale(mon, 0.5)
   clear(mon, colors.black)
   local w, h = sizeOf(mon)
   frameBox(mon, onCol, colors.gray)
-  rect(mon, 3, 3, w - 2, h - 3, colors.black)
-  frameBox(mon, onCol, colors.gray)
+  movingBorder(mon, frame, { onCol, pulseCol or colors.white, colors.black, offCol })
   centerText(mon, 2, title, colors.white, colors.black)
-  local gap = 3
+
+  local gap = math.max(2, math.floor(w * 0.04))
   local digitW = math.floor((w - 6 - gap) / 2)
-  local digitH = h - 9
+  local digitH = h - 10
   local y = 4
   local x1 = 3
   local x2 = x1 + digitW + gap
   drawDigit(mon, x1, y, digitW, digitH, pair:sub(1, 1), onCol, offCol)
   drawDigit(mon, x2, y, digitW, digitH, pair:sub(2, 2), onCol, offCol)
-  centerText(mon, h - 3, foot, colors.white, colors.black)
-  progress(mon, h - 2, secRatio, onCol, colors.gray)
+  centerText(mon, h - 3, footer, colors.white, colors.black)
+  progress(mon, h - 2, secRatio, pulseCol or onCol, colors.gray)
 end
 
-local partyWordsLeft = { "COLIN", "LASER", "HYPE", "BASS", "CYAN" }
-local partyWordsRight = { "MARCEL", "DROP", "RAVE", "BOOM", "GOLD" }
-local partyWordsCenter = { "PARTY", "LOUD", "DROP", "HYPE", "WOW" }
-local legendWordsCenter = { "LEGEND", "MAX", "B2B", "ULTRA", "BOSS" }
-local rainbow = { colors.red, colors.orange, colors.yellow, colors.lime, colors.green, colors.cyan, colors.lightBlue, colors.blue, colors.purple, colors.magenta, colors.pink }
-
-local function drawPartyWord(mon, word, main, accent, frame)
-  setScale(mon, 1.5)
-  clear(mon, colors.black)
-  local w, h = sizeOf(mon)
-  rect(mon, 1, 1, w, h, colors.black)
-  for y = 2, h - 1 do
-    local col = ((y + frame) % 2 == 0) and main or accent
-    rect(mon, 2, y, w - 1, y, col)
-  end
-  rect(mon, 3, 3, w - 2, h - 2, colors.black)
-  frameBox(mon, accent, colors.white)
-  local mid = math.floor(h / 2)
-  centerText(mon, mid - 1, word, colors.white, colors.black)
-  if h >= 6 then
-    centerText(mon, h - 2, "PARTY!", accent, colors.black)
-  end
-end
-
-local function renderNormalLeft(dt, frame)
-  local foot = (frame % 20 < 10) and "COLIN" or "STUNDEN"
-  drawPair(leftMon, string.format("%02d", dt.hour), colors.cyan, colors.gray, "COLIN", foot, dt.sec / 59)
-  local w = sizeOf(leftMon)
-  local tickX = 3 + ((frame * 2) % math.max(1, w - 6))
-  rect(leftMon, tickX, 3, math.min(tickX + 1, w - 2), 3, colors.lightBlue)
-end
-
-local function renderNormalRight(dt, frame)
-  local foot = (frame % 20 < 10) and "MARCEL" or "MINUTEN"
-  drawPair(rightMon, string.format("%02d", dt.min), colors.orange, colors.gray, "MARCEL", foot, dt.sec / 59)
-  local w = sizeOf(rightMon)
-  local tickX = 3 + ((frame * 2 + 8) % math.max(1, w - 6))
-  rect(rightMon, tickX, 3, math.min(tickX + 1, w - 2), 3, colors.yellow)
-end
-
-local function renderNormalCenter(dt, frame)
-  setScale(centerMon, 1)
+local function drawNormalCenter(dt, frame)
+  setScale(centerMon, 0.5)
   clear(centerMon, colors.black)
   local w, h = sizeOf(centerMon)
   frameBox(centerMon, colors.white, colors.gray)
+  movingBorder(centerMon, frame, { colors.cyan, colors.lightBlue, colors.black, colors.gray })
+
   local pulse = (dt.sec % 2 == 0) and colors.lime or colors.green
-  rect(centerMon, 3, 3, w - 2, h - 2, colors.black)
-
-  if h >= 7 then
-    centerText(centerMon, 2, "ME SYSTEM", colors.white, colors.black)
-    local dotsCol = (dt.sec % 2 == 0) and colors.cyan or colors.orange
-    centerText(centerMon, math.floor(h / 2) - 1, ":", dotsCol, colors.black)
-    centerText(centerMon, math.floor(h / 2), "Applied Energistics 2", colors.lightBlue, colors.black)
-    centerText(centerMon, math.floor(h / 2) + 1, string.format("SEK %02d", dt.sec), pulse, colors.black)
-    centerText(centerMon, math.floor(h / 2) + 2, "Touch oder P = Party", colors.yellow, colors.black)
-    centerText(centerMon, h - 1, "L oder 3x Mitte = Legend", colors.lightGray, colors.black)
-  else
-    centerText(centerMon, 2, "ME SYSTEM", colors.white, colors.black)
-    centerText(centerMon, math.max(3, math.floor(h / 2) - 1), "Applied Energistics", colors.lightBlue, colors.black)
-    centerText(centerMon, math.max(4, math.floor(h / 2) + 1), string.format("SEK %02d", dt.sec), pulse, colors.black)
-    centerText(centerMon, h, "P = Party", colors.yellow, colors.black)
-  end
-
-  equalizer(centerMon, frame, h - 2, math.max(2, math.floor(h / 3)), { colors.cyan, colors.lightBlue, colors.lime, colors.orange })
+  centerText(centerMon, 2, "ME SYSTEM", colors.white, colors.black)
+  centerText(centerMon, 4, "Applied Energistics 2", colors.lightBlue, colors.black)
+  centerText(centerMon, 6, string.format("%02d:%02d:%02d", dt.hour, dt.min, dt.sec), colors.yellow, colors.black)
+  centerText(centerMon, 8, "COLIN x MARCEL", colors.cyan, colors.black)
+  centerText(centerMon, h - 4, "Touch / P = Party", colors.orange, colors.black)
+  centerText(centerMon, h - 3, "3x Mitte / L = Legend", colors.pink, colors.black)
+  centerText(centerMon, h - 2, "ME Hall Display", pulse, colors.black)
+  spectrum(centerMon, frame, h - 6, math.max(3, math.floor(h / 3)), { colors.cyan, colors.lightBlue, colors.lime, colors.orange, colors.magenta })
 end
 
-local function renderParty(frame, legend)
-  local leftWord = partyWordsLeft[(math.floor(frame / 4) % #partyWordsLeft) + 1]
-  local rightWord = partyWordsRight[(math.floor(frame / 4) % #partyWordsRight) + 1]
-  local centerWord = (legend and legendWordsCenter or partyWordsCenter)[(math.floor(frame / 3) % #(legend and legendWordsCenter or partyWordsCenter)) + 1]
+local function drawPartySide(mon, pair, title, footer, palette, frame, legend)
+  local onCol = palette[((math.floor(frame / 2)) % #palette) + 1]
+  local pulse = palette[((math.floor(frame / 2) + 2) % #palette) + 1]
+  local offCol = legend and colors.gray or colors.lightGray
+  drawPair(mon, pair, onCol, offCol, title, footer, (frame % 60) / 59, frame, pulse)
+  local w, h = sizeOf(mon)
+  local stripeCol = palette[((math.floor(frame / 3) + 4) % #palette) + 1]
+  rect(mon, 3, 4, w - 2, 4, stripeCol)
+  rect(mon, 3, h - 4, w - 2, h - 4, stripeCol)
+  spectrum(mon, frame, h - 5, math.max(2, math.floor(h / 5)), palette)
+end
 
-  drawPartyWord(leftMon, leftWord, colors.cyan, colors.lightBlue, frame)
-  drawPartyWord(rightMon, rightWord, colors.orange, colors.yellow, frame)
-
-  setScale(centerMon, 1)
+local function drawPartyCenter(frame, legend)
+  setScale(centerMon, 0.5)
   clear(centerMon, colors.black)
   local w, h = sizeOf(centerMon)
-  local main = legend and colors.magenta or colors.lime
-  local alt = legend and colors.purple or colors.cyan
-  stripeBackground(centerMon, frame, main, alt, colors.black)
-  rect(centerMon, 2, 2, w - 1, h - 1, colors.black)
-  frameBox(centerMon, colors.white, main)
-  centerText(centerMon, 2, "ME SYSTEM", colors.yellow, colors.black)
+  local palette = legend
+      and { colors.magenta, colors.purple, colors.red, colors.orange, colors.yellow }
+      or { colors.lime, colors.cyan, colors.lightBlue, colors.pink, colors.orange }
+
+  frameBox(centerMon, colors.white, palette[((math.floor(frame / 2)) % #palette) + 1])
+  movingBorder(centerMon, frame, palette)
+
+  rect(centerMon, 3, 3, w - 2, h - 2, colors.black)
+  centerText(centerMon, 2, "ME SYSTEM", colors.white, colors.black)
   centerText(centerMon, 4, "Applied Energistics 2", colors.lightBlue, colors.black)
-  centerText(centerMon, math.max(5, math.floor(h / 2) + 1), centerWord, colors.white, colors.black)
-  if h >= 7 then
-    centerText(centerMon, h - 2, legend and "LEGEND MODE" or "PARTY MODE", main, colors.black)
-    centerText(centerMon, h - 1, "Touch / P / L", colors.lightGray, colors.black)
-  end
-  equalizer(centerMon, frame * 2, h - 3, math.max(3, math.floor(h / 2)), rainbow)
+  centerText(centerMon, 7, legend and "LEGEND MODE" or "PARTY MODE", palette[((math.floor(frame / 2)) % #palette) + 1], colors.black)
+  centerText(centerMon, 9, "COLIN x MARCEL", colors.yellow, colors.black)
+  centerText(centerMon, h - 4, legend and "MAXIMUM RAVE" or "DISCO AKTIV", colors.white, colors.black)
+  centerText(centerMon, h - 3, "P = Party   L = Legend", colors.lightGray, colors.black)
+  centerText(centerMon, h - 2, "Touch = auch okay", colors.gray, colors.black)
+  spectrum(centerMon, frame * 2, h - 6, math.max(4, math.floor(h / 2.8)), palette)
 end
 
-local function playForGroup(group, instrument, volume, pitch)
-  if #speakers == 0 then return end
-  for i, sp in ipairs(speakers) do
-    local okGroup = false
-    if group == "all" then
-      okGroup = true
-    elseif group == "a" then
-      okGroup = ((i - 1) % 3) == 0
-    elseif group == "b" then
-      okGroup = ((i - 1) % 3) == 1
-    elseif group == "c" then
-      okGroup = ((i - 1) % 3) == 2
-    end
-    if okGroup then
-      pcall(function() sp.playNote(instrument, volume, clamp(pitch, 0, 24)) end)
+local function groupSpeakerIndexes(group)
+  local idx = {}
+  for i = 1, #speakers do
+    local ok = false
+    if group == "all" then ok = true
+    elseif group == "a" then ok = ((i - 1) % 3) == 0
+    elseif group == "b" then ok = ((i - 1) % 3) == 1
+    elseif group == "c" then ok = ((i - 1) % 3) == 2 end
+    if ok then idx[#idx + 1] = i end
+  end
+  return idx
+end
+
+local speakerGroups = {
+  all = groupSpeakerIndexes("all"),
+  a = groupSpeakerIndexes("a"),
+  b = groupSpeakerIndexes("b"),
+  c = groupSpeakerIndexes("c"),
+}
+
+local function playGroup(group, instrument, volume, pitch)
+  local list = speakerGroups[group] or speakerGroups.all
+  for _, i in ipairs(list) do
+    local sp = speakers[i]
+    pcall(function() sp.playNote(instrument, volume, clamp(pitch, 0, 24)) end)
+  end
+end
+
+local noteQueue = {}
+local function enqueue(delay, group, instrument, volume, pitch)
+  noteQueue[#noteQueue + 1] = {
+    t = os.clock() + (delay or 0),
+    group = group,
+    instrument = instrument,
+    volume = volume,
+    pitch = pitch,
+  }
+end
+
+local function sortQueue()
+  table.sort(noteQueue, function(a, b) return a.t < b.t end)
+end
+
+local function processNotes()
+  local now = os.clock()
+  local i = 1
+  while i <= #noteQueue do
+    local n = noteQueue[i]
+    if n.t <= now then
+      playGroup(n.group, n.instrument, n.volume, n.pitch)
+      table.remove(noteQueue, i)
+    else
+      i = i + 1
     end
   end
 end
 
-local progParty = { 12, 10, 8, 7 }
-local progLegend = { 12, 15, 10, 8 }
-local melody = { 12, 15, 17, 15, 12, 10, 8, 10, 12, 15, 19, 15, 12, 10, 8, 7 }
-local legendMelody = { 12, 17, 19, 17, 15, 19, 20, 19, 17, 22, 24, 22, 19, 17, 15, 12 }
-local musicStep = 0
+local function queueIntro(legend)
+  local seq = legend and { 8, 12, 15, 19, 22 } or { 7, 10, 14, 17, 19 }
+  for i, p in ipairs(seq) do
+    enqueue((i - 1) * 0.06, "all", legend and "bell" or "chime", legend and 3 or 2, p)
+  end
+  sortQueue()
+end
 
-local function playBeat(legend)
+local function queueMinuteChime(hour)
+  local base = ({ 8, 12, 15, 19 })[(hour % 4) + 1]
+  enqueue(0.00, "all", "bell", 2, base)
+  enqueue(0.12, "all", "chime", 2, base + 4)
+  enqueue(0.24, "all", "pling", 1, base + 7)
+  sortQueue()
+end
+
+local partyProgression = { 8, 13, 10, 15 }
+local legendProgression = { 8, 15, 17, 13 }
+local partyLead = { 15, 17, 19, 17, 15, 12, 10, 12, 15, 17, 19, 22, 19, 17, 15, 12 }
+local legendLead = { 15, 19, 22, 19, 17, 22, 24, 22, 19, 17, 15, 19, 22, 24, 22, 19 }
+local beatStep = 0
+
+local function beatTick(legend)
   if #speakers == 0 then return end
-  musicStep = musicStep + 1
-  local step = ((musicStep - 1) % 16) + 1
-  local bar = math.floor((musicStep - 1) / 16) % 4 + 1
-  local root = (legend and progLegend or progParty)[bar]
-  local lead = (legend and legendMelody or melody)[step]
+  beatStep = beatStep + 1
+  local step = ((beatStep - 1) % 16) + 1
+  local bar = math.floor((beatStep - 1) / 16) % 4 + 1
+  local root = (legend and legendProgression or partyProgression)[bar]
+  local lead = (legend and legendLead or partyLead)[step]
 
-  if step == 1 or step == 9 then
-    playForGroup("all", "basedrum", 3, 0)
+  if step == 1 or step == 5 or step == 9 or step == 13 then
+    playGroup("all", "basedrum", legend and 3 or 2, 0)
   end
   if step == 5 or step == 13 then
-    playForGroup("all", "snare", 2, 0)
+    playGroup("all", "snare", 2, 0)
   end
   if step % 2 == 0 then
-    playForGroup(step % 4 == 0 and "a" or "b", "hat", 1, 0)
+    playGroup(step % 4 == 0 and "b" or "a", "hat", 1, 0)
   end
-  if step == 3 or step == 7 or step == 11 or step == 15 then
-    playForGroup("c", "bass", 2, root)
+  if step == 12 or step == 16 then
+    playGroup("c", "hat", 2, 0)
   end
+
+  if step == 1 or step == 3 or step == 7 or step == 9 or step == 11 or step == 15 then
+    playGroup("c", "bass", 2, root)
+  end
+
   if step == 1 or step == 5 or step == 9 or step == 13 then
-    playForGroup("a", legend and "bit" or "pling", 2, root)
-    playForGroup("b", legend and "bit" or "pling", 2, root + 3)
-    playForGroup("c", legend and "bit" or "pling", 2, root + 7)
+    playGroup("a", legend and "bit" or "pling", 2, root + 12)
+    playGroup("b", legend and "bit" or "flute", 2, root + 16)
+    playGroup("c", legend and "bell" or "chime", 1, root + 19)
   end
-  if step == 4 or step == 8 or step == 12 or step == 16 then
-    playForGroup("all", legend and "bell" or "chime", 2, lead)
-  elseif step % 4 == 2 then
-    playForGroup(step % 8 == 2 and "a" or "b", legend and "flute" or "guitar", 1, lead)
-  end
-end
 
-local function playIntro(legend)
-  local seq = legend and { 7, 10, 12, 15, 19, 22 } or { 5, 7, 10, 12, 14, 17 }
-  for _, p in ipairs(seq) do
-    playForGroup("all", legend and "bell" or "chime", legend and 3 or 2, p)
-    sleep(0.04)
+  if step == 3 or step == 7 or step == 11 or step == 15 then
+    playGroup(step == 7 or step == 15 and "all" or "b", legend and "bell" or "pling", legend and 2 or 1, lead)
+  elseif step == 4 or step == 8 or step == 12 or step == 16 then
+    playGroup(step % 8 == 0 and "a" or "b", legend and "flute" or "guitar", 1, lead - 12)
   end
-end
-
-local function minuteChime(dt)
-  if #speakers == 0 then return end
-  local p = ({ 12, 15, 19, 22 })[(dt.hour % 4) + 1]
-  playForGroup("all", "bell", 2, p)
-  sleep(0.05)
-  playForGroup("all", "chime", 2, p + 3)
 end
 
 local function splash()
   for _, mon in ipairs({ leftMon, centerMon, rightMon }) do
-    setScale(mon, 1)
+    setScale(mon, 0.5)
     clear(mon, colors.black)
-    frameBox(mon, colors.white, colors.lightBlue)
+    frameBox(mon, colors.white, colors.gray)
     local _, h = sizeOf(mon)
     centerText(mon, math.max(2, math.floor(h / 2) - 1), "ME SYSTEM", colors.cyan, colors.black)
     centerText(mon, math.max(3, math.floor(h / 2)), "Applied Energistics 2", colors.white, colors.black)
-    centerText(mon, math.max(4, math.floor(h / 2) + 1), "bootet...", colors.lightGray, colors.black)
+    centerText(mon, math.max(4, math.floor(h / 2) + 1), "startet...", colors.lightGray, colors.black)
   end
-  playForGroup("all", "pling", 2, 7)
-  sleep(0.04)
-  playForGroup("all", "chime", 2, 12)
-  sleep(0.04)
-  playForGroup("all", "bell", 2, 19)
+  enqueue(0.00, "all", "pling", 2, 8)
+  enqueue(0.08, "all", "chime", 2, 12)
+  enqueue(0.16, "all", "bell", 2, 17)
+  sortQueue()
 end
-
-splash()
 
 term.setBackgroundColor(colors.black)
 term.setTextColor(colors.white)
 term.clear()
 term.setCursorPos(1, 1)
-print("Triple Mega Clock laeuft")
+print("Triple ME Clock laeuft")
 print("Links : " .. leftName)
 print("Mitte : " .. centerName)
 print("Rechts: " .. rightName)
 print("Speaker: " .. #speakers)
-print("Touch auf einen Monitor oder P = Party")
-print("L oder 3 schnelle Touches in der Mitte = Legend")
+print("Touch / P = Party")
+print("3x Mitte / L = Legend")
 print("Beenden mit Ctrl+T")
 
-local bootClock = os.clock()
+splash()
+
 local frame = 0
 local partyUntil = 0
 local legendUntil = 0
@@ -474,7 +462,7 @@ local centerTouches = {}
 local function pushCenterTouch(ts)
   centerTouches[#centerTouches + 1] = ts
   while #centerTouches > 5 do table.remove(centerTouches, 1) end
-  while #centerTouches > 0 and ts - centerTouches[1] > 1.6 do table.remove(centerTouches, 1) end
+  while #centerTouches > 0 and ts - centerTouches[1] > 1.5 do table.remove(centerTouches, 1) end
 end
 
 local function isLegendTouchBurst()
@@ -485,11 +473,11 @@ local function startParty(seconds, legend)
   local now = os.clock()
   if legend then
     legendUntil = math.max(legendUntil, now + seconds)
-    partyUntil = math.max(partyUntil, legendUntil)
-    playIntro(true)
+    partyUntil = math.max(partyUntil, now + seconds)
+    queueIntro(true)
   else
     partyUntil = math.max(partyUntil, now + seconds)
-    playIntro(false)
+    queueIntro(false)
   end
 end
 
@@ -499,18 +487,21 @@ local function render()
   local legend = legendUntil > now
   local party = partyUntil > now
 
-  if legend or party then
-    renderParty(frame, legend)
-    playBeat(legend)
+  if party or legend then
+    drawPartySide(leftMon, string.format("%02d", dt.hour), "COLIN", legend and "LEGEND" or "PARTY", { colors.cyan, colors.lightBlue, colors.white }, frame, legend)
+    drawPartyCenter(frame, legend)
+    drawPartySide(rightMon, string.format("%02d", dt.min), "MARCEL", legend and "RAVE" or "DROP", { colors.orange, colors.yellow, colors.white }, frame, legend)
   else
-    renderNormalLeft(dt, frame)
-    renderNormalCenter(dt, frame)
-    renderNormalRight(dt, frame)
+    drawPair(leftMon, string.format("%02d", dt.hour), colors.cyan, colors.gray, "COLIN", "STUNDEN", dt.sec / 59, frame, colors.lightBlue)
+    drawNormalCenter(dt, frame)
+    drawPair(rightMon, string.format("%02d", dt.min), colors.orange, colors.gray, "MARCEL", "MINUTEN", dt.sec / 59, frame, colors.yellow)
   end
 
   local minuteKey = string.format("%02d:%02d", dt.hour, dt.min)
-  if minuteKey ~= lastMinuteKey then
-    minuteChime(dt)
+  if dt.sec == 0 and minuteKey ~= lastMinuteKey then
+    queueMinuteChime(dt.hour)
+    lastMinuteKey = minuteKey
+  elseif lastMinuteKey == nil then
     lastMinuteKey = minuteKey
   end
 
@@ -519,13 +510,29 @@ local function render()
   end
 end
 
-local timer = os.startTimer(0.12)
+local renderTimer = os.startTimer(0.10)
+local beatTimer = os.startTimer(0.125)
+local noteTimer = os.startTimer(0.05)
+
 while true do
-  local ev, a, b, c = os.pullEvent()
-  if ev == "timer" and a == timer then
-    frame = frame + 1
-    render()
-    timer = os.startTimer(0.12)
+  local ev, a = os.pullEvent()
+  if ev == "timer" then
+    if a == renderTimer then
+      frame = frame + 1
+      processNotes()
+      render()
+      renderTimer = os.startTimer(0.10)
+    elseif a == beatTimer then
+      processNotes()
+      local now = os.clock()
+      if partyUntil > now or legendUntil > now then
+        beatTick(legendUntil > now)
+      end
+      beatTimer = os.startTimer(0.125)
+    elseif a == noteTimer then
+      processNotes()
+      noteTimer = os.startTimer(0.05)
+    end
   elseif ev == "monitor_touch" then
     local monName = a
     local ts = os.clock()
@@ -535,21 +542,21 @@ while true do
         centerTouches = {}
         startParty(75, true)
       else
-        startParty(50, false)
+        startParty(40, false)
       end
     elseif monName == leftName or monName == rightName then
-      startParty(40, false)
+      startParty(35, false)
     end
   elseif ev == "char" then
     local ch = tostring(a or ""):lower()
     if ch == "p" then
-      startParty(50, false)
+      startParty(40, false)
     elseif ch == "l" then
       startParty(75, true)
     end
   elseif ev == "terminate" then
     for _, mon in ipairs({ leftMon, centerMon, rightMon }) do
-      setScale(mon, 1)
+      setScale(mon, 0.5)
       clear(mon, colors.black)
       frameBox(mon, colors.gray, colors.lightGray)
       local _, h = sizeOf(mon)
