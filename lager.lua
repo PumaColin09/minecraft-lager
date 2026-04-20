@@ -3,7 +3,7 @@
 -- Auto-detects the two largest monitors and all speakers.
 -- Optional: chrono_show_dual <monitorA> <monitorB>
 
-local VERSION = "1.0"
+local VERSION = "1.1"
 
 local CONFIG = {
   textScale = 0.5,
@@ -168,8 +168,12 @@ local function detectMonitors()
     if peripheral.getType(name) == "monitor" then
       local mon = peripheral.wrap(name)
       pcall(mon.setTextScale, CONFIG.textScale)
-      local ok, w, h = pcall(mon.getSize)
-      if ok then
+      local ok, w, h = pcall(function()
+        return mon.getSize()
+      end)
+      w = tonumber(w)
+      h = tonumber(h)
+      if ok and w and h and w > 0 and h > 0 then
         found[#found + 1] = { name = name, obj = mon, w = w, h = h, area = w * h }
       end
     end
@@ -217,6 +221,25 @@ local function detectMonitors()
   end
 end
 
+local function refreshMonitorGeometry(monData)
+  if not monData or not monData.obj then return 0, 0 end
+
+  local ok, w, h = pcall(function()
+    return monData.obj.getSize()
+  end)
+
+  w = tonumber(w) or tonumber(monData.w) or 0
+  h = tonumber(h) or tonumber(monData.h) or 0
+
+  if ok and w > 0 and h > 0 then
+    monData.w = w
+    monData.h = h
+    monData.area = w * h
+  end
+
+  return monData.w or 0, monData.h or 0
+end
+
 local function makeParticles(termWidth, termHeight, count)
   local list = {}
   for i = 1, count do
@@ -236,7 +259,12 @@ local function refreshParticlePools()
   particles = {}
   for i = 1, #monitors do
     local mon = monitors[i]
-    particles[i] = makeParticles(mon.w, mon.h, clamp(math.floor(mon.area / 80), 12, 48))
+    local w, h = refreshMonitorGeometry(mon)
+    if w > 0 and h > 0 then
+      particles[i] = makeParticles(w, h, clamp(math.floor((mon.area or (w * h)) / 80), 12, 48))
+    else
+      particles[i] = {}
+    end
   end
 end
 
@@ -488,7 +516,8 @@ end
 
 local function renderLeft(monData, snap)
   local mon = monData.obj
-  local w, h = mon.w, mon.h
+  local w, h = refreshMonitorGeometry(monData)
+  if w < 1 or h < 1 then return end
   clear(mon, colors.black)
 
   for y = 1, h do
@@ -521,7 +550,8 @@ end
 
 local function renderRight(monData, snap)
   local mon = monData.obj
-  local w, h = mon.w, mon.h
+  local w, h = refreshMonitorGeometry(monData)
+  if w < 1 or h < 1 then return end
   clear(mon, colors.black)
 
   for y = 1, h do
@@ -565,12 +595,13 @@ local function renderRight(monData, snap)
   writeAt(mon, 5, panelTop + 2, "MC   : " .. snap.gameFmt .. "  (" .. snap.phase .. ")", colors.lightBlue, colors.black)
   writeAt(mon, 5, panelTop + 3, ("Next bell in %02ds"):format(snap.nextMinute + 1), colors.lime, colors.black)
   writeAt(mon, 5, panelTop + 4, ("Uptime %ds | Party %s"):format(snap.uptime, state.partyUntil > os.clock() and "AN" or "AUS"), colors.orange, colors.black)
-  writeAt(mon, 5, panelTop + 5, ("Monitor %s | %dx%d"):format(monData.name, monData.w, monData.h), colors.gray, colors.black)
+  writeAt(mon, 5, panelTop + 5, ("Monitor %s | %dx%d"):format(monData.name, w, h), colors.gray, colors.black)
 end
 
 local function renderSingle(monData, snap)
   local mon = monData.obj
-  local w, h = mon.w, mon.h
+  local w, h = refreshMonitorGeometry(monData)
+  if w < 1 or h < 1 then return end
   clear(mon, colors.black)
   drawParticles(mon, 1)
   drawBox(mon, 1, 1, w, h, colors.cyan, colors.black, " CHRONOSHOW SINGLE ")
@@ -591,11 +622,15 @@ end
 
 local function bootSequence()
   for i = 1, #monitors do
-    local mon = monitors[i].obj
-    clear(mon, colors.black)
-    drawBox(mon, 1, 1, monitors[i].w, monitors[i].h, colors.cyan, colors.black, " MARCEL CHRONOSHOW BOOT ")
-    centerWrite(mon, math.floor(monitors[i].h / 2) - 2, "Synchronisiere Monitore", colors.white, colors.black)
-    drawBar(mon, 5, math.floor(monitors[i].h / 2), monitors[i].w - 8, 0, colors.lime, colors.black, "0%")
+    local monData = monitors[i]
+    local mon = monData.obj
+    local w, h = refreshMonitorGeometry(monData)
+    if w > 0 and h > 0 then
+      clear(mon, colors.black)
+      drawBox(mon, 1, 1, w, h, colors.cyan, colors.black, " MARCEL CHRONOSHOW BOOT ")
+      centerWrite(mon, math.floor(h / 2) - 2, "Synchronisiere Monitore", colors.white, colors.black)
+      drawBar(mon, 5, math.floor(h / 2), w - 8, 0, colors.lime, colors.black, "0%")
+    end
   end
 
   local steps = {
@@ -609,9 +644,13 @@ local function bootSequence()
   for i = 1, #steps do
     local ratio = i / #steps
     for m = 1, #monitors do
-      local mon = monitors[m].obj
-      centerWrite(mon, math.floor(monitors[m].h / 2) - 1, steps[i], COLOR_CYCLE[((i + m) % #COLOR_CYCLE) + 1], colors.black)
-      drawBar(mon, 5, math.floor(monitors[m].h / 2), monitors[m].w - 8, ratio, colors.lime, colors.black, ("%d%%"):format(math.floor(ratio * 100)))
+      local monData = monitors[m]
+      local mon = monData.obj
+      local w, h = refreshMonitorGeometry(monData)
+      if w > 0 and h > 0 then
+        centerWrite(mon, math.floor(h / 2) - 1, steps[i], COLOR_CYCLE[((i + m) % #COLOR_CYCLE) + 1], colors.black)
+        drawBar(mon, 5, math.floor(h / 2), w - 8, ratio, colors.lime, colors.black, ("%d%%"):format(math.floor(ratio * 100)))
+      end
     end
     if i == 2 and #speakers > 0 then queueTouchPling() end
     sleep(0.28)
@@ -701,9 +740,11 @@ local function cleanup()
     pcall(speakers[i].obj.stop)
   end
   for i = 1, #monitors do
-    local mon = monitors[i].obj
+    local monData = monitors[i]
+    local mon = monData.obj
+    local _, h = refreshMonitorGeometry(monData)
     clear(mon, colors.black)
-    centerWrite(mon, math.floor(monitors[i].h / 2), "ChronoShow beendet", colors.white, colors.black)
+    centerWrite(mon, math.floor(h / 2), "ChronoShow beendet", colors.white, colors.black)
   end
 end
 
