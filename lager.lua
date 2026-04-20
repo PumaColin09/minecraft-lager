@@ -1,3034 +1,738 @@
-local CONFIG_FILE = "lager_me_prio_config.txt"
-local ROLE_MARKER_SLOT = 1
-local DEFAULT_MONITOR_SCALE = 0.5
-local DEFAULT_SCAN_INTERVAL = 8
-local DEFAULT_PAGE_INTERVAL = 6
-local DEFAULT_SUPPORT_INTERVAL = 2
-local LARGE_MONITOR_MIN_W = 36
-local LARGE_MONITOR_MIN_H = 18
-local MAX_SMALL_LINES = 18
+-- Marcel ChronoShow
+-- Two-monitor clock show for CC:Tweaked
+-- Auto-detects the two largest monitors and all speakers.
+-- Optional: chrono_show_dual <monitorA> <monitorB>
 
-local state = {
-  running = true,
-  snapshot = nil,
-  previous = nil,
-  page = 1,
-  tick = 0,
-  easterUnlocked = false,
-  lastScan = 0,
-  lastPageSwitch = 0,
-  lastSupportRun = 0,
-  lastSupportMoved = 0,
-  lastSupportMovedPriority = 0,
-  lastSupportStayed = 0,
-  lastSupportTouched = 0,
-  lastSupportNote = "-",
-  config = {
-    monitorName = nil,
-    monitorDisabled = false,
-    monitorScale = DEFAULT_MONITOR_SCALE,
-    meBridgeName = nil,
-    meBridgeDisabled = false,
-    scanInterval = DEFAULT_SCAN_INTERVAL,
-    pageInterval = DEFAULT_PAGE_INTERVAL,
-    vaultNames = nil,
-    priorityName = nil,
-    supportEnabled = true,
-    supportInterval = DEFAULT_SUPPORT_INTERVAL,
-  },
+local VERSION = "1.0"
+
+local CONFIG = {
+  textScale = 0.5,
+  frameDelay = 0.12,
+  partySeconds = 32,
+  quoteDelay = 8,
+  minuteChime = true,
+  quarterChime = true,
+  hourChime = true,
+  touchPartyCount = 5,
+  touchWindow = 5,
 }
 
-local function nowMs()
-  return os.epoch("utc")
+local args = { ... }
+if #args >= 1 then CONFIG.monitorAName = args[1] end
+if #args >= 2 then CONFIG.monitorBName = args[2] end
+
+local QUOTES = {
+  "ZEIT FLIESST. REDSTONE AUCH.",
+  "MARCEL-O-MATIC ONLINE",
+  "KAFFEE > SCHLAF > BUGFIX",
+  "DIE GLOCKE WEISS ALLES",
+  "HEUTE WIRD NICHT GESTRESST",
+  "TICK. TOCK. BOOM.",
+  "MONITOREN HABEN AUCH GEFUEHLE",
+  "AE2 KANN WARTEN. UHR LAEUFT.",
+  "ICH BIN NICHT SPAET. DIE SEKUNDEN SIND FRUEH.",
+}
+
+local COLOR_CYCLE = {
+  colors.cyan,
+  colors.lightBlue,
+  colors.blue,
+  colors.purple,
+  colors.magenta,
+  colors.pink,
+  colors.red,
+  colors.orange,
+  colors.yellow,
+  colors.lime,
+  colors.green,
+}
+
+local FONT = {
+  ["0"] = { "11111", "10001", "10001", "10001", "11111" },
+  ["1"] = { "00100", "01100", "00100", "00100", "01110" },
+  ["2"] = { "11111", "00001", "11111", "10000", "11111" },
+  ["3"] = { "11111", "00001", "01111", "00001", "11111" },
+  ["4"] = { "10001", "10001", "11111", "00001", "00001" },
+  ["5"] = { "11111", "10000", "11111", "00001", "11111" },
+  ["6"] = { "11111", "10000", "11111", "10001", "11111" },
+  ["7"] = { "11111", "00010", "00100", "01000", "01000" },
+  ["8"] = { "11111", "10001", "11111", "10001", "11111" },
+  ["9"] = { "11111", "10001", "11111", "00001", "11111" },
+  [":"] = { "0", "1", "0", "1", "0" },
+  [" "] = { "0", "0", "0", "0", "0" },
+}
+
+local state = {
+  startClock = os.clock(),
+  quoteIndex = 1,
+  nextQuoteAt = 0,
+  partyUntil = 0,
+  statusMessage = "ChronoShow online",
+  statusUntil = 0,
+  lastMinute = nil,
+  lastSecond = nil,
+  frame = 0,
+  soundFlashUntil = 0,
+  touchTimes = {},
+}
+
+local monitors = {}
+local speakers = {}
+local soundQueue = {}
+local particles = {}
+
+local function clamp(v, lo, hi)
+  if v < lo then return lo end
+  if v > hi then return hi end
+  return v
 end
 
-local function trim(text)
-  return (tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+local function round(n)
+  return math.floor(n + 0.5)
 end
 
-local function safeNumber(value)
-  value = tonumber(value)
-  if value then
-    return value
-  end
-  return nil
-end
-
-local function sortedNames()
-  local names = peripheral.getNames()
-  table.sort(names)
-  return names
-end
-
-local function clip(text, maxLen)
-  text = tostring(text or "")
-  if maxLen <= 0 then
-    return ""
-  end
-  if #text <= maxLen then
-    return text
-  end
-  if maxLen == 1 then
-    return text:sub(1, 1)
-  end
-  return text:sub(1, maxLen - 1) .. ">"
-end
-
-local function formatCount(n)
-  n = math.floor(tonumber(n) or 0)
-  local s = tostring(n)
-  local out = ""
-
-  while #s > 3 do
-    out = "." .. s:sub(-3) .. out
-    s = s:sub(1, -4)
-  end
-
-  return s .. out
-end
-
-local function formatCompact(n)
-  n = tonumber(n) or 0
-  local abs = math.abs(n)
-  local value = n
-  local suffix = ""
-
-  if abs >= 1000000000 then
-    value = n / 1000000000
-    suffix = "G"
-  elseif abs >= 1000000 then
-    value = n / 1000000
-    suffix = "M"
-  elseif abs >= 1000 then
-    value = n / 1000
-    suffix = "k"
-  else
-    return formatCount(n)
-  end
-
-  return (string.format("%.1f%s", value, suffix):gsub("%.0([kMG])$", "%1"))
-end
-
-local function formatMaybeCount(n)
-  if n == nil then
-    return "-"
-  end
-  return formatCount(n)
-end
-
-local function formatPercent(part, total)
-  part = tonumber(part) or 0
-  total = tonumber(total) or 0
-  if total <= 0 then
-    return "0.0%"
-  end
-  return string.format("%.1f%%", (part / total) * 100)
-end
-
-local function formatRate(n)
-  if n == nil then
-    return "-"
-  end
-  return formatCount(n) .. " FE/t"
-end
-
-local function formatEnergy(stored, capacity)
-  if stored == nil and capacity == nil then
-    return "-"
-  end
-  if capacity and capacity > 0 then
-    return formatCount(stored or 0) .. "/" .. formatCount(capacity) .. " FE"
-  end
-  return formatCount(stored or 0) .. " FE"
-end
-
-local function formatSince(ms)
-  if not ms or ms <= 0 then
-    return "-"
-  end
-
-  local sec = math.floor((nowMs() - ms) / 1000)
-  if sec < 60 then
-    return tostring(sec) .. "s"
-  end
-
-  local min = math.floor(sec / 60)
-  local rest = sec % 60
-  return tostring(min) .. "m " .. tostring(rest) .. "s"
-end
-
-local function joinList(list, sep)
+local function splitWords(str)
   local out = {}
-  for _, value in ipairs(list or {}) do
-    out[#out + 1] = tostring(value)
+  for word in tostring(str):gmatch("%S+") do
+    out[#out + 1] = word
   end
-  return table.concat(out, sep or ", ")
-end
-
-local function namespaceOf(itemName)
-  return tostring(itemName or ""):match("^(.-):") or "unknown"
-end
-
-local function baseNameOf(itemName)
-  return tostring(itemName or ""):match(":(.+)$") or tostring(itemName or "")
-end
-
-local function prettyModName(ns)
-  local map = {
-    minecraft = "Minecraft",
-    ae2 = "Applied Energistics 2",
-    advancedperipherals = "Advanced Peripherals",
-    computercraft = "CC: Tweaked",
-    create = "Create",
-    mekanism = "Mekanism",
-    storagedrawers = "Storage Drawers",
-    refinedstorage = "Refined Storage",
-    farmersdelight = "Farmer's Delight",
-  }
-
-  if map[ns] then
-    return map[ns]
-  end
-
-  ns = tostring(ns or ""):gsub("_", " ")
-  return (ns:gsub("(%a)([%w ]*)", function(a, b)
-    return a:upper() .. b:lower()
-  end))
-end
-
-local function listPeripheralTypes(name)
-  local raw = { peripheral.getType(name) }
-  local out = {}
-  local seen = {}
-
-  for _, value in ipairs(raw) do
-    if value and value ~= "" and not seen[value] then
-      seen[value] = true
-      out[#out + 1] = tostring(value)
-    end
-  end
-
-  table.sort(out)
   return out
 end
 
-local function hasType(name, typeName)
-  if not name or not peripheral.isPresent(name) then
-    return false
-  end
-
-  if peripheral.hasType then
-    local ok, value = pcall(peripheral.hasType, name, typeName)
-    if ok then
-      return value and true or false
-    end
-  end
-
-  for _, value in ipairs(listPeripheralTypes(name)) do
-    if value == typeName then
-      return true
-    end
-  end
-
-  return false
-end
-
-local function isMEBridgeName(name)
-  return hasType(name, 'meBridge') or hasType(name, 'me_bridge')
-end
-
-local function safeWrap(name)
-  if not name or not peripheral.isPresent(name) then
-    return nil
-  end
-
-  local ok, value = pcall(peripheral.wrap, name)
-  if ok then
-    return value
-  end
-  return nil
-end
-
-local function hasMethod(object, methodName)
-  return object and type(object[methodName]) == "function"
-end
-
-local function safeCall(object, methodName, ...)
-  if not hasMethod(object, methodName) then
-    return nil
-  end
-
-  local ok, a, b, c, d = pcall(object[methodName], ...)
-  if ok then
-    return a, b, c, d
-  end
-  return nil
-end
-
-local function firstNumericCall(object, methods)
-  for _, methodName in ipairs(methods or {}) do
-    local value = safeNumber(safeCall(object, methodName))
-    if value ~= nil then
-      return value, methodName
-    end
-  end
-  return nil, nil
-end
-
-local function readFile(path)
-  if not fs.exists(path) then
-    return nil
-  end
-
-  local h = fs.open(path, "r")
-  if not h then
-    return nil
-  end
-
-  local raw = h.readAll()
-  h.close()
-  return raw
-end
-
-local function writeFile(path, text)
-  local h = fs.open(path, "w")
-  if not h then
-    return false
-  end
-
-  h.write(text or "")
-  h.close()
-  return true
-end
-
-local function loadConfig()
-  local raw = readFile(CONFIG_FILE)
-  if not raw or raw == "" then
-    return
-  end
-
-  local data = textutils.unserialize(raw)
-  if type(data) ~= "table" then
-    return
-  end
-
-  if type(data.monitorName) == "string" then
-    state.config.monitorName = data.monitorName
-  end
-  if type(data.monitorDisabled) == "boolean" then
-    state.config.monitorDisabled = data.monitorDisabled
-  end
-  if tonumber(data.monitorScale) then
-    state.config.monitorScale = tonumber(data.monitorScale)
-  end
-  if type(data.meBridgeName) == "string" then
-    state.config.meBridgeName = data.meBridgeName
-  end
-  if type(data.meBridgeDisabled) == "boolean" then
-    state.config.meBridgeDisabled = data.meBridgeDisabled
-  end
-  if tonumber(data.scanInterval) then
-    state.config.scanInterval = math.max(2, math.floor(tonumber(data.scanInterval)))
-  end
-  if tonumber(data.pageInterval) then
-    state.config.pageInterval = math.max(2, math.floor(tonumber(data.pageInterval)))
-  end
-  if type(data.vaultNames) == "table" then
-    local clean = {}
-    for _, name in ipairs(data.vaultNames) do
-      if type(name) == "string" and name ~= "" then
-        clean[#clean + 1] = name
-      end
-    end
-    if #clean > 0 then
-      state.config.vaultNames = clean
+local function wrapText(text, width)
+  local words = splitWords(text)
+  local lines = {}
+  local line = ""
+  for i = 1, #words do
+    local word = words[i]
+    local candidate = line == "" and word or (line .. " " .. word)
+    if #candidate <= width then
+      line = candidate
     else
-      state.config.vaultNames = nil
+      if line ~= "" then lines[#lines + 1] = line end
+      line = word
     end
   end
-  if type(data.priorityName) == "string" then
-    state.config.priorityName = data.priorityName
-  end
-  if type(data.supportEnabled) == "boolean" then
-    state.config.supportEnabled = data.supportEnabled
-  end
-  if tonumber(data.supportInterval) then
-    state.config.supportInterval = math.max(1, math.floor(tonumber(data.supportInterval)))
-  end
+  if line ~= "" then lines[#lines + 1] = line end
+  if #lines == 0 then lines[1] = "" end
+  return lines
 end
 
-local function saveConfig()
-  writeFile(CONFIG_FILE, textutils.serialize(state.config))
+local function phaseName(gameTime)
+  local h = math.floor(gameTime) % 24
+  if h >= 6 and h < 11 then return "Morgen" end
+  if h >= 11 and h < 18 then return "Tag" end
+  if h >= 18 and h < 21 then return "Abend" end
+  return "Nacht"
 end
 
-local function monitorArea(name)
-  if not name or not peripheral.isPresent(name) or not hasType(name, "monitor") then
-    return 0, 0, 0
-  end
-
-  local monitor = safeWrap(name)
-  if not monitor then
-    return 0, 0, 0
-  end
-
-  local width, height = safeCall(monitor, "getSize")
-  width = math.floor(tonumber(width) or 0)
-  height = math.floor(tonumber(height) or 0)
-  return width * height, width, height
-end
-
-local function resolveMonitorName()
-  if state.config.monitorDisabled then
-    return nil
-  end
-
-  if state.config.monitorName and state.config.monitorName ~= "" and peripheral.isPresent(state.config.monitorName) and hasType(state.config.monitorName, "monitor") then
-    return state.config.monitorName
-  end
-
-  local bestName = nil
-  local bestArea = -1
-  local bestWidth = -1
-  local bestHeight = -1
-
-  for _, name in ipairs(sortedNames()) do
-    if hasType(name, "monitor") then
-      local area, width, height = monitorArea(name)
-      if area > bestArea
-        or (area == bestArea and width > bestWidth)
-        or (area == bestArea and width == bestWidth and height > bestHeight)
-        or (area == bestArea and width == bestWidth and height == bestHeight and (not bestName or tostring(name) < tostring(bestName))) then
-        bestName = name
-        bestArea = area
-        bestWidth = width
-        bestHeight = height
-      end
-    end
-  end
-
-  return bestName
-end
-
-local function resolveMeBridgeName()
-  if state.config.meBridgeDisabled then
-    return nil
-  end
-
-  if state.config.meBridgeName and state.config.meBridgeName ~= "" and peripheral.isPresent(state.config.meBridgeName) and isMEBridgeName(state.config.meBridgeName) then
-    return state.config.meBridgeName
-  end
-
-  for _, name in ipairs(sortedNames()) do
-    if isMEBridgeName(name) then
-      return name
-    end
-  end
-
-  return nil
-end
-
-local function resolveSpeakerName()
-  for _, name in ipairs(sortedNames()) do
-    if hasType(name, "speaker") then
-      return name
-    end
-  end
-  return nil
-end
-
-local function playSecretJingle()
-  local name = resolveSpeakerName()
-  if not name then
-    return false
-  end
-
-  local speaker = safeWrap(name)
-  if not speaker then
-    return false
-  end
-
-  if hasMethod(speaker, "playNote") then
-    local sequence = {
-      { "bell", 3, 12 },
-      { "bell", 3, 16 },
-      { "chime", 3, 19 },
-      { "bell", 3, 24 },
-    }
-
-    for _, note in ipairs(sequence) do
-      pcall(speaker.playNote, note[1], note[2], note[3])
-      sleep(0.12)
-    end
-    return true
-  end
-
-  if hasMethod(speaker, "playSound") then
-    pcall(speaker.playSound, "block.note_block.bell", 1, 1)
-    return true
-  end
-
-  return false
-end
-
-local function parseMarker(detail)
-  if type(detail) ~= "table" then
-    return nil
-  end
-
-  local raw = trim(detail.displayName or detail.name)
-  if raw == "" then
-    return nil
-  end
-
-  local normalized = raw:upper():gsub("%s+", "")
-  normalized = normalized:gsub("^%[", ""):gsub("%]$", "")
-
-  if not normalized:find("^LAGER:") then
-    return nil
-  end
-
-  return normalized:sub(7)
-end
-
-local function inventoryMarker(inv)
-  if not inv then
-    return nil
-  end
-
-  local detail = safeCall(inv, "getItemDetail", ROLE_MARKER_SLOT)
-  if not detail then
-    return nil
-  end
-
-  return parseMarker(detail)
-end
-
-local function isIgnoredInventory(inv)
-  local marker = inventoryMarker(inv)
-  return marker == "IGNORE" or marker == "OFF"
-end
-
-local function typesContain(name, needle)
-  needle = tostring(needle or ""):lower()
-  if needle == "" then
-    return false
-  end
-
-  if tostring(name or ""):lower():find(needle, 1, true) then
-    return true
-  end
-
-  for _, value in ipairs(listPeripheralTypes(name)) do
-    if tostring(value or ""):lower():find(needle, 1, true) then
-      return true
-    end
-  end
-
-  return false
-end
-
-local function isPriorityControllerName(name)
-  if not name or not peripheral.isPresent(name) or not hasType(name, "inventory") then
-    return false
-  end
-
-  if typesContain(name, "storage_controller")
-    or typesContain(name, "controller_access")
-    or typesContain(name, "controlleraccess")
-    or typesContain(name, "drawer_controller") then
-    return true
-  end
-
-  local lowerName = tostring(name or ""):lower()
-  if lowerName:find("functionalstorage", 1, true) and lowerName:find("controller", 1, true) then
-    return true
-  end
-
-  return false
-end
-
-local function isVaultName(name)
-  if not name or not peripheral.isPresent(name) or not hasType(name, "inventory") then
-    return false
-  end
-
-  if typesContain(name, "item_vault")
-    or typesContain(name, "itemvault")
-    or typesContain(name, "create:item_vault") then
-    return true
-  end
-
-  local lowerName = tostring(name or ""):lower()
-  if lowerName:find("item_vault", 1, true)
-    or lowerName:find("itemvault", 1, true)
-    or (lowerName:find("create", 1, true) and lowerName:find("vault", 1, true)) then
-    return true
-  end
-
-  return false
-end
-
-local function resolveVaultNames()
-  local out = {}
-  local seen = {}
-
-  local function add(name)
-    if not name or name == "" or seen[name] then
-      return
-    end
-    if peripheral.isPresent(name) and hasType(name, "inventory") then
-      seen[name] = true
-      out[#out + 1] = name
-    end
-  end
-
-  if type(state.config.vaultNames) == "table" and #state.config.vaultNames > 0 then
-    for _, name in ipairs(state.config.vaultNames) do
-      add(name)
-    end
-    table.sort(out)
-    return out
-  end
-
-  for _, name in ipairs(sortedNames()) do
-    if hasType(name, "inventory") then
-      local inv = safeWrap(name)
-      local marker = inv and inventoryMarker(inv) or nil
-      if marker == "VAULT" or marker == "SOURCE" then
-        add(name)
-      end
-    end
-  end
-
-  if #out > 0 then
-    table.sort(out)
-    return out
-  end
-
-  for _, name in ipairs(sortedNames()) do
-    if isVaultName(name) then
-      add(name)
-    end
-  end
-
-  table.sort(out)
-  return out
-end
-
-local function resolvePriorityName()
-  if state.config.priorityName and state.config.priorityName ~= "" and peripheral.isPresent(state.config.priorityName) and hasType(state.config.priorityName, "inventory") then
-    return state.config.priorityName
-  end
-
-  for _, name in ipairs(sortedNames()) do
-    if hasType(name, "inventory") then
-      local inv = safeWrap(name)
-      local marker = inv and inventoryMarker(inv) or nil
-      if marker == "PRIO" or marker == "PRIORITY" then
-        return name
-      end
-    end
-  end
-
-  for _, name in ipairs(sortedNames()) do
-    if isPriorityControllerName(name) then
-      return name
-    end
-  end
-
-  return nil
-end
-
-local function buildSupportStatus()
-  local vaultNames = resolveVaultNames()
+local function getClockSnapshot()
+  local localTime = os.time("local") or 0
+  local hour = math.floor(localTime) % 24
+  local minute = math.floor(((localTime - math.floor(localTime)) * 60) + 1e-6)
+  local second = math.floor((os.epoch("local") / 1000) % 60)
+  local gameTime = os.time() or 0
+  local uptime = math.floor(os.clock() - state.startClock)
+  local secondsToNextMinute = 59 - second
   return {
-    enabled = state.config.supportEnabled and true or false,
-    vaultNames = vaultNames,
-    vaultCount = #vaultNames,
-    priorityName = resolvePriorityName(),
-    meBridgeName = resolveMeBridgeName(),
-    interval = state.config.supportInterval,
-    lastRun = state.lastSupportRun,
-    lastMoved = state.lastSupportMoved,
-    lastMovedPriority = state.lastSupportMovedPriority or 0,
-    lastStayed = state.lastSupportStayed or 0,
-    lastTouched = state.lastSupportTouched or 0,
-    lastNote = state.lastSupportNote,
+    hour = hour,
+    minute = minute,
+    second = second,
+    hm = string.format("%02d:%02d", hour, minute),
+    hms = string.format("%02d:%02d:%02d", hour, minute, second),
+    localFmt = textutils.formatTime(localTime, true),
+    gameFmt = textutils.formatTime(gameTime, true),
+    phase = phaseName(gameTime),
+    uptime = uptime,
+    minuteProgress = second / 59,
+    epoch = os.epoch("local"),
+    secondPulse = math.sin((second / 60) * math.pi * 2),
+    nextMinute = secondsToNextMinute,
   }
 end
 
-local function sortedSlotKeys(list)
-  local keys = {}
-  for slot in pairs(list or {}) do
-    keys[#keys + 1] = tonumber(slot) or slot
+local function detectSpeakers()
+  local found = {}
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "speaker" then
+      found[#found + 1] = { name = name, obj = peripheral.wrap(name) }
+    end
   end
-  table.sort(keys, function(a, b)
-    return tonumber(a) < tonumber(b)
-  end)
-  return keys
+  table.sort(found, function(a, b) return a.name < b.name end)
+  speakers = found
 end
 
-local function slotCount(inv, slot)
-  local list = safeCall(inv, "list") or {}
-  local item = list and list[slot] or nil
-  return tonumber(item and item.count or 0) or 0
-end
-
-local function buildPriorityItemSet(target)
-  local out = {}
-  if not target then
-    return out
-  end
-
-  local list = safeCall(target, "list") or {}
-  for slot, item in pairs(list) do
-    if item and item.name and tonumber(item.count or 0) > 0 then
-      local detail = safeCall(target, "getItemDetail", slot) or item
-      local key = tostring(detail.name)
-      out[key] = true
-      if detail.fingerprint then
-        out[key .. "#" .. tostring(detail.fingerprint)] = true
+local function detectMonitors()
+  local found = {}
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "monitor" then
+      local mon = peripheral.wrap(name)
+      pcall(mon.setTextScale, CONFIG.textScale)
+      local ok, w, h = pcall(mon.getSize)
+      if ok then
+        found[#found + 1] = { name = name, obj = mon, w = w, h = h, area = w * h }
       end
     end
   end
 
-  return out
-end
+  table.sort(found, function(a, b)
+    if a.area == b.area then return a.name < b.name end
+    return a.area > b.area
+  end)
 
-local function isPriorityItem(detail, prioritySet)
-  if not detail or not detail.name then
-    return false
-  end
-
-  if prioritySet[tostring(detail.name)] then
-    return true
-  end
-
-  if detail.fingerprint and prioritySet[tostring(detail.name) .. "#" .. tostring(detail.fingerprint)] then
-    return true
-  end
-
-  return false
-end
-
-local function buildBridgeFilter(detail, slot, count)
-  local filter = {
-    name = detail.name,
-    count = math.max(1, math.floor(tonumber(count) or tonumber(detail.count) or 1)),
-    fromSlot = tonumber(slot),
-    type = "item",
-  }
-
-  if detail.fingerprint then
-    filter.fingerprint = detail.fingerprint
-  end
-
-  if detail.components then
-    filter.components = detail.components
-  elseif detail.nbt then
-    filter.nbt = detail.nbt
-  end
-
-  return filter
-end
-
-local function runSupportMove(silent)
-  local support = buildSupportStatus()
-
-  if not support.enabled then
-    state.lastSupportNote = "Sortierung aus"
-    return 0
-  end
-
-  if not support.priorityName then
-    state.lastSupportNote = "Kein Controller gefunden"
-    if not silent then
-      print("Kein Functional-Storage-Controller gefunden.")
+  local selected = {}
+  if CONFIG.monitorAName then
+    for i = 1, #found do
+      if found[i].name == CONFIG.monitorAName then
+        selected[#selected + 1] = found[i]
+        break
+      end
     end
-    return 0
   end
-
-  if not support.vaultNames or #support.vaultNames == 0 then
-    state.lastSupportNote = "Keine Vaults gefunden"
-    if not silent then
-      print("Keine Create Item Vaults gefunden.")
-    end
-    return 0
-  end
-
-  local controller = safeWrap(support.priorityName)
-  if not controller then
-    state.lastSupportNote = "Controller nicht erreichbar"
-    if not silent then
-      print("Controller konnte nicht geoeffnet werden.")
-    end
-    return 0
-  end
-
-  local prioritySet = buildPriorityItemSet(controller)
-  if not next(prioritySet) then
-    state.lastSupportRun = nowMs()
-    state.lastSupportMoved = 0
-    state.lastSupportMovedPriority = 0
-    state.lastSupportStayed = 0
-    state.lastSupportTouched = 0
-    state.lastSupportNote = "Controller ist leer"
-    if not silent then
-      print("Im Controller wurden noch keine priorisierten Items gefunden.")
-    end
-    return 0
-  end
-
-  local movedTotal = 0
-  local movedPriority = 0
-  local stayed = 0
-  local touched = 0
-  local checkedSources = 0
-
-  for _, vaultName in ipairs(support.vaultNames) do
-    if vaultName ~= support.priorityName then
-      local vault = safeWrap(vaultName)
-      if vault and hasMethod(vault, "pushItems") then
-        checkedSources = checkedSources + 1
-        local list = safeCall(vault, "list") or {}
-        for _, slot in ipairs(sortedSlotKeys(list)) do
-          local basic = list[slot]
-          if basic and basic.name and tonumber(basic.count or 0) > 0 then
-            local detail = safeCall(vault, "getItemDetail", slot) or basic
-            local isMarker = (slot == ROLE_MARKER_SLOT and parseMarker(detail) ~= nil)
-            if not isMarker and isPriorityItem(detail, prioritySet) then
-              local before = slotCount(vault, slot)
-              local movedNow = safeNumber(safeCall(vault, "pushItems", support.priorityName, slot)) or 0
-              local after = slotCount(vault, slot)
-              if movedNow > 0 then
-                movedPriority = movedPriority + movedNow
-                movedTotal = movedTotal + movedNow
-                touched = touched + 1
-              end
-              if after > 0 and before > 0 then
-                stayed = stayed + after
-              end
-            end
-          end
+  if CONFIG.monitorBName then
+    for i = 1, #found do
+      if found[i].name == CONFIG.monitorBName then
+        local dupe = false
+        for j = 1, #selected do
+          if selected[j].name == found[i].name then dupe = true end
         end
-      end
-    end
-  end
-
-  state.lastSupportRun = nowMs()
-  state.lastSupportMoved = movedTotal
-  state.lastSupportMovedPriority = movedPriority
-  state.lastSupportStayed = stayed
-  state.lastSupportTouched = touched
-
-  if movedTotal > 0 then
-    state.lastSupportNote = "Controller " .. formatCount(movedPriority) .. " | In Vaults " .. formatCount(stayed)
-    if not silent then
-      print("Sortiert: " .. formatCount(movedPriority) .. " -> Controller | in Vaults geblieben: " .. formatCount(stayed) .. " (" .. tostring(touched) .. " Stapel, " .. tostring(checkedSources) .. " Vaults)")
-    end
-  else
-    if stayed > 0 then
-      state.lastSupportNote = "Controller voll / kein Platz"
-      if not silent then
-        print("Nichts vollstaendig bewegt. Der Controller nimmt aktuell keine weiteren priorisierten Items auf.")
-      end
-    else
-      state.lastSupportNote = "Nichts bewegt"
-      if not silent then
-        print("Nichts bewegt. Entweder liegen keine priorisierten Items in den Vaults oder der Controller ist voll.")
-      end
-    end
-  end
-
-  return movedTotal
-end
-
-
-local function buildItemKey(item)
-  local nbt = item.nbt or item.fingerprint or item.itemFingerprint or ""
-  return tostring(item.name or "unknown") .. "#" .. tostring(nbt)
-end
-
-local function mergeItem(map, detail, source, amount)
-  if not detail or not detail.name then
-    return
-  end
-
-  amount = tonumber(amount) or 0
-  if amount == 0 then
-    return
-  end
-
-  local key = buildItemKey(detail)
-  local entry = map[key]
-
-  if not entry then
-    entry = {
-      key = key,
-      name = detail.name,
-      displayName = detail.displayName or baseNameOf(detail.name),
-      mod = namespaceOf(detail.name),
-      localCount = 0,
-      meCount = 0,
-      totalCount = 0,
-    }
-    map[key] = entry
-  end
-
-  if source == "local" then
-    entry.localCount = entry.localCount + amount
-  elseif source == "me" then
-    entry.meCount = entry.meCount + amount
-  end
-
-  entry.totalCount = entry.localCount + entry.meCount
-end
-
-local function sortItemMap(map)
-  local out = {}
-  for _, entry in pairs(map or {}) do
-    out[#out + 1] = entry
-  end
-
-  table.sort(out, function(a, b)
-    if a.totalCount ~= b.totalCount then
-      return a.totalCount > b.totalCount
-    end
-    return tostring(a.displayName) < tostring(b.displayName)
-  end)
-
-  return out
-end
-
-local function sortModMap(map)
-  local out = {}
-  for mod, count in pairs(map or {}) do
-    out[#out + 1] = {
-      mod = mod,
-      label = prettyModName(mod),
-      count = count,
-    }
-  end
-
-  table.sort(out, function(a, b)
-    if a.count ~= b.count then
-      return a.count > b.count
-    end
-    return tostring(a.label) < tostring(b.label)
-  end)
-
-  return out
-end
-
-local function buildLocalStats()
-  local stats = {
-    inventoryCount = 0,
-    totalSlots = 0,
-    usedSlots = 0,
-    freeSlots = 0,
-    totalItems = 0,
-    inventories = {},
-    byKey = {},
-    modCounts = {},
-  }
-
-  for _, name in ipairs(sortedNames()) do
-    if hasType(name, "inventory") then
-      local inv = safeWrap(name)
-      if inv and not isIgnoredInventory(inv) then
-        local size = tonumber(safeCall(inv, "size")) or 0
-        local list = safeCall(inv, "list") or {}
-        local used = 0
-        local items = 0
-
-        for slot, item in pairs(list) do
-          if item and item.name and item.count then
-            local detail = safeCall(inv, "getItemDetail", slot) or item
-            if not (slot == ROLE_MARKER_SLOT and parseMarker(detail)) then
-              local count = tonumber(item.count) or 0
-              used = used + 1
-              items = items + count
-              stats.totalItems = stats.totalItems + count
-
-              mergeItem(stats.byKey, detail, "local", count)
-              local ns = namespaceOf(detail.name)
-              stats.modCounts[ns] = (stats.modCounts[ns] or 0) + count
-            end
-          end
-        end
-
-        stats.inventoryCount = stats.inventoryCount + 1
-        stats.totalSlots = stats.totalSlots + size
-        stats.usedSlots = stats.usedSlots + used
-        stats.freeSlots = stats.freeSlots + math.max(0, size - used)
-
-        stats.inventories[#stats.inventories + 1] = {
-          name = name,
-          types = joinList(listPeripheralTypes(name), "/"),
-          size = size,
-          usedSlots = used,
-          freeSlots = math.max(0, size - used),
-          totalItems = items,
-        }
-      end
-    end
-  end
-
-  table.sort(stats.inventories, function(a, b)
-    if a.totalItems ~= b.totalItems then
-      return a.totalItems > b.totalItems
-    end
-    if a.usedSlots ~= b.usedSlots then
-      return a.usedSlots > b.usedSlots
-    end
-    return tostring(a.name) < tostring(b.name)
-  end)
-
-  stats.order = sortItemMap(stats.byKey)
-  stats.uniqueItems = #stats.order
-  stats.modOrder = sortModMap(stats.modCounts)
-  return stats
-end
-
-local function buildMeStats()
-  local name = resolveMeBridgeName()
-  if not name then
-    return {
-      available = false,
-      name = nil,
-      byKey = {},
-      order = {},
-      craftables = {},
-      fluids = {},
-      modCounts = {},
-      craftableCount = 0,
-      fluidCount = 0,
-      totalItems = 0,
-      uniqueItems = 0,
-      cellCount = 0,
-      cpuCount = 0,
-    }
-  end
-
-  local bridge = safeWrap(name)
-  if not bridge then
-    return {
-      available = false,
-      name = name,
-      error = "ME Bridge konnte nicht geoeffnet werden",
-      byKey = {},
-      order = {},
-      craftables = {},
-      fluids = {},
-      modCounts = {},
-      craftableCount = 0,
-      fluidCount = 0,
-      totalItems = 0,
-      uniqueItems = 0,
-      cellCount = 0,
-      cpuCount = 0,
-    }
-  end
-
-  local function tryCalls(methods, ...)
-    for _, methodName in ipairs(methods or {}) do
-      local value = safeCall(bridge, methodName, ...)
-      if value ~= nil then
-        return value
-      end
-    end
-    return nil
-  end
-
-  local function tryList(methods)
-    local empty = {}
-    local value = tryCalls(methods, empty)
-    if value == nil then
-      value = tryCalls(methods)
-    end
-    if type(value) == "table" then
-      return value
-    end
-    return {}
-  end
-
-  local stats = {
-    available = true,
-    name = name,
-    connected = safeCall(bridge, "isConnected"),
-    online = safeCall(bridge, "isOnline"),
-    byKey = {},
-    modCounts = {},
-    craftables = {},
-    fluids = {},
-    cells = {},
-    cpus = {},
-    totalItems = 0,
-    uniqueItems = 0,
-    craftableCount = 0,
-    fluidCount = 0,
-    fluidTotal = 0,
-    cellCount = 0,
-    cpuCount = 0,
-    totalItemStorage = safeNumber(tryCalls({ "getTotalItemStorage" })),
-    usedItemStorage = safeNumber(tryCalls({ "getUsedItemStorage" })),
-    availableItemStorage = safeNumber(tryCalls({ "getAvailableItemStorage" })),
-    totalFluidStorage = safeNumber(tryCalls({ "getTotalFluidStorage" })),
-    usedFluidStorage = safeNumber(tryCalls({ "getUsedFluidStorage" })),
-    availableFluidStorage = safeNumber(tryCalls({ "getAvailableFluidStorage" })),
-    energyStorage = safeNumber(tryCalls({ "getStoredEnergy", "getEnergyStorage" })),
-    maxEnergyStorage = safeNumber(tryCalls({ "getEnergyCapacity", "getMaxEnergyStorage" })),
-    energyUsage = safeNumber(tryCalls({ "getEnergyUsage" })),
-    avgPowerInjection = safeNumber(tryCalls({ "getAvgPowerInjection" })),
-  }
-
-  local items = tryList({ "listItems", "getItems" })
-  for _, item in pairs(items) do
-    if item and item.name then
-      local count = tonumber(item.amount or item.count or item.qty or 0) or 0
-      stats.totalItems = stats.totalItems + count
-      mergeItem(stats.byKey, item, "me", count)
-      local ns = namespaceOf(item.name)
-      stats.modCounts[ns] = (stats.modCounts[ns] or 0) + count
-    end
-  end
-
-  local craftables = tryList({ "listCraftableItems", "getCraftableItems", "getPatterns" })
-  for _, item in pairs(craftables) do
-    local nameKey = item and (item.name or (item.output and item.output.name))
-    if nameKey then
-      stats.craftables[#stats.craftables + 1] = {
-        name = nameKey,
-        displayName = item.displayName or (item.output and item.output.displayName) or baseNameOf(nameKey),
-      }
-    end
-  end
-
-  table.sort(stats.craftables, function(a, b)
-    return tostring(a.displayName) < tostring(b.displayName)
-  end)
-
-  local fluids = tryList({ "listFluids", "listFluid", "getFluids" })
-  for _, fluid in pairs(fluids) do
-    if fluid and fluid.name then
-      local amount = tonumber(fluid.amount or fluid.count or fluid.qty or 0) or 0
-      stats.fluidTotal = stats.fluidTotal + amount
-      stats.fluids[#stats.fluids + 1] = {
-        name = fluid.name,
-        displayName = fluid.displayName or baseNameOf(fluid.name),
-        amount = amount,
-      }
-    end
-  end
-
-  table.sort(stats.fluids, function(a, b)
-    if a.amount ~= b.amount then
-      return a.amount > b.amount
-    end
-    return tostring(a.displayName) < tostring(b.displayName)
-  end)
-
-  stats.cells = tryList({ "listCells" })
-  stats.cpus = tryList({ "getCraftingCPUs", "getCraftingTasks" })
-
-  stats.order = sortItemMap(stats.byKey)
-  stats.uniqueItems = #stats.order
-  stats.modOrder = sortModMap(stats.modCounts)
-  stats.craftableCount = #stats.craftables
-  stats.fluidCount = #stats.fluids
-
-  for _ in pairs(stats.cells) do
-    stats.cellCount = stats.cellCount + 1
-  end
-  for _ in pairs(stats.cpus) do
-    stats.cpuCount = stats.cpuCount + 1
-  end
-
-  return stats
-end
-
-local function buildCombinedStats(localStats, meStats)
-  local combined = {
-    byKey = {},
-    modCounts = {},
-    totalItems = 0,
-    uniqueItems = 0,
-  }
-
-  local function mergeExistingEntry(sourceEntry)
-    if not sourceEntry or not sourceEntry.key then
-      return
-    end
-
-    local entry = combined.byKey[sourceEntry.key]
-    if not entry then
-      entry = {
-        key = sourceEntry.key,
-        name = sourceEntry.name,
-        displayName = sourceEntry.displayName,
-        mod = sourceEntry.mod,
-        localCount = 0,
-        meCount = 0,
-        totalCount = 0,
-      }
-      combined.byKey[sourceEntry.key] = entry
-    end
-
-    entry.localCount = entry.localCount + (sourceEntry.localCount or 0)
-    entry.meCount = entry.meCount + (sourceEntry.meCount or 0)
-    entry.totalCount = entry.localCount + entry.meCount
-  end
-
-  for _, entry in ipairs(localStats.order or {}) do
-    mergeExistingEntry(entry)
-  end
-  for _, entry in ipairs(meStats.order or {}) do
-    mergeExistingEntry(entry)
-  end
-
-  for mod, count in pairs(localStats.modCounts or {}) do
-    combined.modCounts[mod] = (combined.modCounts[mod] or 0) + count
-  end
-  for mod, count in pairs(meStats.modCounts or {}) do
-    combined.modCounts[mod] = (combined.modCounts[mod] or 0) + count
-  end
-
-  combined.order = sortItemMap(combined.byKey)
-  combined.uniqueItems = #combined.order
-  combined.totalItems = (localStats.totalItems or 0) + (meStats.totalItems or 0)
-  combined.modOrder = sortModMap(combined.modCounts)
-  return combined
-end
-
-local function buildEnergyStats(meStats)
-  local stats = {
-    sources = {},
-    totalStored = 0,
-    totalCapacity = 0,
-    totalRate = 0,
-    totalUsage = 0,
-  }
-
-  for _, name in ipairs(sortedNames()) do
-    if not meStats.name or name ~= meStats.name then
-      local obj = safeWrap(name)
-      if obj then
-        local stored = firstNumericCall(obj, { "getEnergyStorage", "getEnergyStored", "getEnergy" })
-        local capacity = firstNumericCall(obj, { "getMaxEnergyStorage", "getMaxEnergyStored", "getEnergyCapacity" })
-        local rate = firstNumericCall(obj, { "getTransferRate", "getEnergyTransferRate", "getFlow", "getEnergyIn" })
-        local usage = firstNumericCall(obj, { "getEnergyUsage", "getConsumption", "getPowerUsage" })
-
-        if stored ~= nil or capacity ~= nil or rate ~= nil or usage ~= nil then
-          stats.sources[#stats.sources + 1] = {
-            name = name,
-            types = joinList(listPeripheralTypes(name), "/"),
-            stored = stored,
-            capacity = capacity,
-            rate = rate,
-            usage = usage,
-          }
-          stats.totalStored = stats.totalStored + (stored or 0)
-          stats.totalCapacity = stats.totalCapacity + (capacity or 0)
-          stats.totalRate = stats.totalRate + (rate or 0)
-          stats.totalUsage = stats.totalUsage + (usage or 0)
-        end
-      end
-    end
-  end
-
-  if meStats.available and (meStats.energyStorage ~= nil or meStats.maxEnergyStorage ~= nil or meStats.energyUsage ~= nil) then
-    stats.sources[#stats.sources + 1] = {
-      name = meStats.name .. " (ME)",
-      types = "meBridge",
-      stored = meStats.energyStorage,
-      capacity = meStats.maxEnergyStorage,
-      rate = nil,
-      usage = meStats.energyUsage,
-    }
-    stats.totalStored = stats.totalStored + (meStats.energyStorage or 0)
-    stats.totalCapacity = stats.totalCapacity + (meStats.maxEnergyStorage or 0)
-    stats.totalUsage = stats.totalUsage + (meStats.energyUsage or 0)
-  end
-
-  table.sort(stats.sources, function(a, b)
-    local aKey = math.abs(a.rate or a.usage or a.stored or 0)
-    local bKey = math.abs(b.rate or b.usage or b.stored or 0)
-    if aKey ~= bKey then
-      return aKey > bKey
-    end
-    return tostring(a.name) < tostring(b.name)
-  end)
-
-  return stats
-end
-
-local function buildPeripheralSummary()
-  local summary = {
-    total = 0,
-    inventory = 0,
-    monitor = 0,
-    meBridge = 0,
-    modem = 0,
-    speaker = 0,
-    energy = 0,
-    list = {},
-  }
-
-  for _, name in ipairs(sortedNames()) do
-    local types = listPeripheralTypes(name)
-    local joined = joinList(types, "/")
-    summary.total = summary.total + 1
-    if hasType(name, "inventory") then
-      summary.inventory = summary.inventory + 1
-    end
-    if hasType(name, "monitor") then
-      summary.monitor = summary.monitor + 1
-    end
-    if isMEBridgeName(name) then
-      summary.meBridge = summary.meBridge + 1
-    end
-    if hasType(name, "modem") then
-      summary.modem = summary.modem + 1
-    end
-    if hasType(name, "speaker") then
-      summary.speaker = summary.speaker + 1
-    end
-
-    local obj = safeWrap(name)
-    if obj and firstNumericCall(obj, { "getTransferRate", "getEnergyStorage", "getEnergyStored", "getEnergy", "getEnergyUsage" }) ~= nil then
-      summary.energy = summary.energy + 1
-    end
-
-    summary.list[#summary.list + 1] = {
-      name = name,
-      types = joined,
-    }
-  end
-
-  return summary
-end
-
-local function buildChanges(previous, current)
-  local prevMap = previous and previous.combined and previous.combined.byKey or {}
-  local currMap = current and current.combined and current.combined.byKey or {}
-  local keys = {}
-  local changes = {}
-
-  for key in pairs(prevMap or {}) do
-    keys[key] = true
-  end
-  for key in pairs(currMap or {}) do
-    keys[key] = true
-  end
-
-  for key in pairs(keys) do
-    local before = prevMap[key] and prevMap[key].totalCount or 0
-    local after = currMap[key] and currMap[key].totalCount or 0
-    if before ~= after then
-      local ref = currMap[key] or prevMap[key]
-      changes[#changes + 1] = {
-        key = key,
-        name = ref.name,
-        displayName = ref.displayName,
-        delta = after - before,
-        before = before,
-        after = after,
-      }
-    end
-  end
-
-  table.sort(changes, function(a, b)
-    local ad = math.abs(a.delta)
-    local bd = math.abs(b.delta)
-    if ad ~= bd then
-      return ad > bd
-    end
-    return tostring(a.displayName) < tostring(b.displayName)
-  end)
-
-  return changes
-end
-
-local function countMatchingItems(snapshot, patterns)
-  if not snapshot or not snapshot.combined then
-    return 0
-  end
-
-  local total = 0
-  for _, entry in ipairs(snapshot.combined.order or {}) do
-    local hay = (tostring(entry.displayName or "") .. " " .. tostring(entry.name or "")):lower()
-    for _, pattern in ipairs(patterns or {}) do
-      if hay:find(pattern, 1, true) then
-        total = total + (entry.totalCount or 0)
+        if not dupe then selected[#selected + 1] = found[i] end
         break
       end
     end
   end
 
-  return total
+  for i = 1, #found do
+    if #selected >= 2 then break end
+    local dupe = false
+    for j = 1, #selected do
+      if selected[j].name == found[i].name then dupe = true end
+    end
+    if not dupe then selected[#selected + 1] = found[i] end
+  end
+
+  monitors = selected
+  for i = 1, #monitors do
+    pcall(monitors[i].obj.setTextScale, CONFIG.textScale)
+  end
 end
 
-local function scanAll(silent)
-  local previous = state.snapshot
-  local snapshot = {
-    time = nowMs(),
-    monitorName = resolveMonitorName(),
-    meBridgeName = resolveMeBridgeName(),
+local function makeParticles(termWidth, termHeight, count)
+  local list = {}
+  for i = 1, count do
+    list[#list + 1] = {
+      x = math.random() * termWidth,
+      y = math.random() * termHeight,
+      vx = 0.12 + math.random() * 0.32,
+      vy = -0.05 + math.random() * 0.10,
+      color = COLOR_CYCLE[(i % #COLOR_CYCLE) + 1],
+      glyph = (i % 5 == 0) and "+" or ((i % 2 == 0) and "." or "*")
+    }
+  end
+  return list
+end
+
+local function refreshParticlePools()
+  particles = {}
+  for i = 1, #monitors do
+    local mon = monitors[i]
+    particles[i] = makeParticles(mon.w, mon.h, clamp(math.floor(mon.area / 80), 12, 48))
+  end
+end
+
+local function rescanPeripherals()
+  detectMonitors()
+  detectSpeakers()
+  refreshParticlePools()
+  state.statusMessage = ("%d Monitor(e), %d Speaker online"):format(#monitors, #speakers)
+  state.statusUntil = os.clock() + 4
+end
+
+local function playNoteAll(instrument, volume, pitch)
+  for i = 1, #speakers do
+    pcall(speakers[i].obj.playNote, instrument, volume, pitch)
+  end
+  state.soundFlashUntil = os.clock() + 0.25
+end
+
+local function playSoundAll(name, volume, pitch)
+  for i = 1, #speakers do
+    pcall(speakers[i].obj.playSound, name, volume, pitch)
+  end
+  state.soundFlashUntil = os.clock() + 0.30
+end
+
+local function enqueue(event)
+  soundQueue[#soundQueue + 1] = event
+end
+
+local function queueMinuteChime()
+  enqueue({ kind = "note", inst = "chime", vol = 1.1, pitch = 12, delay = 0.00 })
+  enqueue({ kind = "note", inst = "bell", vol = 1.6, pitch = 16, delay = 0.16 })
+end
+
+local function queueQuarterChime(quarter)
+  for i = 1, quarter do
+    enqueue({ kind = "note", inst = "bell", vol = 2.2, pitch = 9, delay = (i == 1) and 0 or 0.45 })
+  end
+  enqueue({ kind = "note", inst = "chime", vol = 1.5, pitch = 17, delay = 0.20 })
+end
+
+local function queueHourChime(hour)
+  for i = 1, 4 do
+    enqueue({ kind = "note", inst = "bell", vol = 2.6, pitch = 8, delay = (i == 1) and 0 or 0.50 })
+  end
+  enqueue({ kind = "note", inst = "chime", vol = 1.6, pitch = 12, delay = 0.22 })
+  enqueue({ kind = "note", inst = "chime", vol = 1.8, pitch = 19, delay = 0.15 })
+  enqueue({ kind = "sound", name = "minecraft:block.amethyst_block.chime", vol = 0.9, pitch = 1.0, delay = 0.22 })
+  state.statusMessage = ("Es ist %02d Uhr!"):format(hour)
+  state.statusUntil = os.clock() + 7
+end
+
+local function queueTouchPling()
+  enqueue({ kind = "note", inst = "pling", vol = 0.9, pitch = 18, delay = 0 })
+end
+
+local function queuePartyFanfare()
+  local seq = {
+    { "bit", 1.0, 10 }, { "bit", 1.0, 14 }, { "bit", 1.0, 17 },
+    { "pling", 1.2, 19 }, { "xylophone", 1.0, 14 }, { "bell", 1.8, 18 },
   }
-
-  snapshot.localStats = buildLocalStats()
-  snapshot.me = buildMeStats()
-  snapshot.combined = buildCombinedStats(snapshot.localStats, snapshot.me)
-  snapshot.energy = buildEnergyStats(snapshot.me)
-  snapshot.peripherals = buildPeripheralSummary()
-  snapshot.support = buildSupportStatus()
-  snapshot.changes = buildChanges(previous, snapshot)
-
-  state.previous = previous
-  state.snapshot = snapshot
-  state.lastScan = snapshot.time
-
-  if not silent then
-    print("Scan fertig: " .. formatCount(snapshot.combined.totalItems) .. " Items gesamt, " .. formatCount(snapshot.combined.uniqueItems) .. " verschiedene Typen.")
+  local first = true
+  for i = 1, #seq do
+    local s = seq[i]
+    enqueue({ kind = "note", inst = s[1], vol = s[2], pitch = s[3], delay = first and 0 or 0.10 })
+    first = false
   end
 end
 
-local function currentMonitor()
-  local name = state.snapshot and state.snapshot.monitorName or resolveMonitorName()
-  if not name then
-    return nil, nil
-  end
-
-  return safeWrap(name), name
+local function startParty(reason)
+  state.partyUntil = os.clock() + CONFIG.partySeconds
+  state.statusMessage = reason or "Party mode!"
+  state.statusUntil = state.partyUntil
+  queuePartyFanfare()
 end
 
-local function addPage(pages, title, lines, kind)
-  pages[#pages + 1] = {
-    title = title,
-    lines = lines,
-    kind = kind or title,
-  }
+local function activeQuote(now)
+  if state.statusUntil > now then
+    return state.statusMessage
+  end
+  if now >= state.nextQuoteAt then
+    state.quoteIndex = (state.quoteIndex % #QUOTES) + 1
+    state.nextQuoteAt = now + CONFIG.quoteDelay
+  end
+  return QUOTES[state.quoteIndex]
 end
 
-local function buildMonitorPages(snapshot)
-  local pages = {}
-  if not snapshot then
-    addPage(pages, "Warten", {
-      "Noch kein Scan vorhanden.",
-      "Bitte 'scan' ausfuehren.",
-    }, "waiting")
-    return pages
-  end
-
-  local localStats = snapshot.localStats
-  local meStats = snapshot.me
-  local combined = snapshot.combined
-  local energy = snapshot.energy
-
-  local support = snapshot.support or buildSupportStatus()
-
-  addPage(pages, "Cockpit", {
-    "Lokale Inventare: " .. formatCount(localStats.inventoryCount),
-    "Lokale Slots: " .. formatCount(localStats.usedSlots) .. "/" .. formatCount(localStats.totalSlots) .. " (" .. formatPercent(localStats.usedSlots, localStats.totalSlots) .. ")",
-    "Lokale Items: " .. formatCount(localStats.totalItems),
-    "Lokale Typen: " .. formatCount(localStats.uniqueItems),
-    "Sortierung: " .. (support.enabled and "AN" or "AUS"),
-    "Vaults: " .. formatCount(support.vaultCount or 0),
-    "Controller: " .. (support.priorityName or "nicht gesetzt"),
-    "ME Bridge: " .. (meStats.available and meStats.name or "nicht gefunden"),
-    "ME Items: " .. formatCount(meStats.totalItems),
-    "Kombi Items: " .. formatCount(combined.totalItems),
-    "Letzter Scan: " .. formatSince(snapshot.time),
-  }, "dashboard")
-
-  local topItemLines = {}
-  if #combined.order == 0 then
-    topItemLines[#topItemLines + 1] = "Keine Items gefunden."
-  else
-    for i = 1, math.min(MAX_SMALL_LINES, #combined.order) do
-      local entry = combined.order[i]
-      local top = tostring(i) .. ". " .. entry.displayName .. " " .. formatCount(entry.totalCount)
-      topItemLines[#topItemLines + 1] = top
-    end
-  end
-  addPage(pages, "Top Items", topItemLines, "items")
-
-  local storageLines = {}
-  if #localStats.inventories == 0 then
-    storageLines[#storageLines + 1] = "Keine lokalen Inventare."
-  else
-    for i = 1, math.min(MAX_SMALL_LINES, #localStats.inventories) do
-      local inv = localStats.inventories[i]
-      storageLines[#storageLines + 1] = tostring(i) .. ". " .. inv.name
-      storageLines[#storageLines + 1] = "   " .. formatCount(inv.totalItems) .. " Items | " .. formatCount(inv.usedSlots) .. "/" .. formatCount(inv.size) .. " Slots"
-    end
-  end
-  addPage(pages, "Lager", storageLines, "storage")
-
-  local supportLines = {
-    "Modus: " .. (support.enabled and "Vault -> Controller aktiv" or "nur Statistik"),
-    "Vaults: " .. formatCount(support.vaultCount or 0),
-    "Controller: " .. (support.priorityName or "nicht gefunden"),
-    "Intervall: " .. tostring(support.interval) .. "s",
-    "Letzter Lauf: " .. formatSince(support.lastRun),
-    "Zum Controller: " .. formatCount(support.lastMovedPriority or 0),
-    "In Vaults: " .. formatCount(support.lastStayed or 0),
-    "Info: " .. tostring(support.lastNote or "-"),
-  }
-  for i = 1, math.min(2, #(support.vaultNames or {})) do
-    supportLines[#supportLines + 1] = "Quelle " .. tostring(i) .. ": " .. tostring(support.vaultNames[i])
-  end
-  addPage(pages, "Support", supportLines, "support")
-
-  local meLines = {}
-  if not meStats.available then
-    meLines[#meLines + 1] = "Keine ME Bridge gefunden."
-  else
-    meLines[#meLines + 1] = "Bridge: " .. meStats.name
-    meLines[#meLines + 1] = "Item-Speicher: " .. formatMaybeCount(meStats.usedItemStorage) .. "/" .. formatMaybeCount(meStats.totalItemStorage)
-    meLines[#meLines + 1] = "Fluid-Speicher: " .. formatMaybeCount(meStats.usedFluidStorage) .. "/" .. formatMaybeCount(meStats.totalFluidStorage)
-    meLines[#meLines + 1] = "ME Energie: " .. formatEnergy(meStats.energyStorage, meStats.maxEnergyStorage)
-    meLines[#meLines + 1] = "ME Verbrauch: " .. formatRate(meStats.energyUsage)
-    meLines[#meLines + 1] = "Craftbar: " .. formatCount(meStats.craftableCount)
-    meLines[#meLines + 1] = "Fluids: " .. formatCount(meStats.fluidCount) .. " Typen"
-  end
-  addPage(pages, "ME System", meLines, "me")
-
-  local energyLines = {}
-  if #energy.sources == 0 then
-    energyLines[#energyLines + 1] = "Keine Stromdaten gefunden."
-    energyLines[#energyLines + 1] = "Tipp: Energy Detector oder"
-    energyLines[#energyLines + 1] = "ME Bridge anschliessen."
-  else
-    energyLines[#energyLines + 1] = "Gespeichert: " .. formatEnergy(energy.totalStored, energy.totalCapacity)
-    energyLines[#energyLines + 1] = "Transfer: " .. formatRate(energy.totalRate)
-    energyLines[#energyLines + 1] = "Verbrauch: " .. formatRate(energy.totalUsage)
-    for i = 1, math.min(MAX_SMALL_LINES - 3, #energy.sources) do
-      local src = energy.sources[i]
-      local line = src.name .. " "
-      if src.rate ~= nil then
-        line = line .. formatRate(src.rate)
-      elseif src.usage ~= nil then
-        line = line .. "Use " .. formatRate(src.usage)
-      else
-        line = line .. formatEnergy(src.stored, src.capacity)
-      end
-      energyLines[#energyLines + 1] = line
-    end
-  end
-  addPage(pages, "Strom", energyLines, "energy")
-
-  local changeLines = {}
-  if #snapshot.changes == 0 then
-    changeLines[#changeLines + 1] = "Seit dem letzten Scan keine"
-    changeLines[#changeLines + 1] = "Aenderungen erkannt."
-  else
-    for i = 1, math.min(MAX_SMALL_LINES, #snapshot.changes) do
-      local entry = snapshot.changes[i]
-      local prefix = entry.delta > 0 and "+" or ""
-      changeLines[#changeLines + 1] = tostring(i) .. ". " .. entry.displayName .. " " .. prefix .. formatCount(entry.delta)
-    end
-  end
-  addPage(pages, "Aenderungen", changeLines, "changes")
-
-  if state.easterUnlocked then
-    addPage(pages, "Marcel", {
-      "Marcel-Modus aktiv.",
-      "Kekse im Netz: " .. formatCount(countMatchingItems(snapshot, { "cookie", "keks" })),
-      "Kuchen im Netz: " .. formatCount(countMatchingItems(snapshot, { "cake", "kuchen" })),
-      "Tipp: 'marcel' schaltet wieder aus.",
-    }, "easter")
-  end
-
-  return pages
+local function setColors(target, fg, bg)
+  target.setTextColor(fg)
+  target.setBackgroundColor(bg)
 end
 
-local function padRight(text, width)
-  text = tostring(text or "")
-  if width <= 0 then
-    return ""
-  end
-  if #text >= width then
-    return text:sub(1, width)
-  end
-  return text .. string.rep(" ", width - #text)
+local function clear(target, bg)
+  target.setBackgroundColor(bg)
+  target.clear()
 end
 
-local function monitorSize(monitor)
-  local width, height = safeCall(monitor, "getSize")
-  return math.floor(tonumber(width) or 0), math.floor(tonumber(height) or 0)
-end
-
-local function isLargeMonitor(width, height)
-  return width >= LARGE_MONITOR_MIN_W and height >= LARGE_MONITOR_MIN_H
-end
-
-local function writeAt(monitor, x, y, text, fg, bg, maxWidth)
-  local width, height = monitorSize(monitor)
-  if width <= 0 or height <= 0 or y < 1 or y > height or x > width then
-    return
-  end
-
-  text = tostring(text or "")
+local function writeAt(target, x, y, text, fg, bg)
+  local w, h = target.getSize()
+  if y < 1 or y > h then return end
+  if x > w or x + #text - 1 < 1 then return end
   if x < 1 then
-    local skip = 1 - x
-    if skip >= #text then
-      return
-    end
-    text = text:sub(skip + 1)
+    text = text:sub(2 - x)
     x = 1
   end
-
-  local available = width - x + 1
-  if maxWidth then
-    available = math.min(available, maxWidth)
+  if x + #text - 1 > w then
+    text = text:sub(1, w - x + 1)
   end
-  if available <= 0 then
-    return
-  end
-
-  text = clip(text, available)
-  if bg then
-    pcall(monitor.setBackgroundColor, bg)
-  end
-  if fg then
-    pcall(monitor.setTextColor, fg)
-  end
-  pcall(monitor.setCursorPos, x, y)
-  pcall(monitor.write, text)
+  setColors(target, fg or colors.white, bg or colors.black)
+  target.setCursorPos(x, y)
+  target.write(text)
 end
 
-local function fillRect(monitor, x, y, width, height, bg, char, fg)
-  if width <= 0 or height <= 0 then
-    return
-  end
+local function centerWrite(target, y, text, fg, bg)
+  local w = select(1, target.getSize())
+  local x = math.floor((w - #text) / 2) + 1
+  writeAt(target, x, y, text, fg, bg)
+end
 
-  local line = string.rep(char or " ", width)
-  for row = 0, height - 1 do
-    writeAt(monitor, x, y + row, line, fg or colors.white, bg, width)
+local function fillRect(target, x1, y1, x2, y2, bg, ch, fg)
+  local w, h = target.getSize()
+  if x2 < 1 or y2 < 1 or x1 > w or y1 > h then return end
+  x1 = clamp(x1, 1, w)
+  x2 = clamp(x2, 1, w)
+  y1 = clamp(y1, 1, h)
+  y2 = clamp(y2, 1, h)
+  local text = string.rep(ch or " ", x2 - x1 + 1)
+  for y = y1, y2 do
+    writeAt(target, x1, y, text, fg or colors.white, bg)
   end
 end
 
-local function drawPanel(monitor, x, y, width, height, title, titleBg, bodyBg, titleFg)
-  if width < 4 or height < 3 then
-    return
+local function drawBox(target, x1, y1, x2, y2, border, fill, title)
+  fillRect(target, x1, y1, x2, y2, fill or colors.black, " ")
+  writeAt(target, x1, y1, "+" .. string.rep("-", math.max(0, x2 - x1 - 1)) .. "+", border, fill)
+  for y = y1 + 1, y2 - 1 do
+    writeAt(target, x1, y, "|", border, fill)
+    writeAt(target, x2, y, "|", border, fill)
   end
-
-  titleBg = titleBg or colors.blue
-  bodyBg = bodyBg or colors.black
-  titleFg = titleFg or colors.white
-
-  fillRect(monitor, x, y, width, height, bodyBg, " ")
-  fillRect(monitor, x, y, width, 1, titleBg, " ")
-  writeAt(monitor, x + 1, y, " " .. clip(title or "", math.max(1, width - 2)), titleFg, titleBg, math.max(1, width - 2))
-end
-
-local function drawCard(monitor, x, y, width, height, title, value, subtitle, accent)
-  if width < 8 or height < 4 then
-    return
+  if y2 > y1 then
+    writeAt(target, x1, y2, "+" .. string.rep("-", math.max(0, x2 - x1 - 1)) .. "+", border, fill)
   end
-
-  drawPanel(monitor, x, y, width, height, title, accent or colors.blue, colors.black, colors.white)
-  writeAt(monitor, x + 2, y + 2, clip(value or "-", math.max(1, width - 4)), colors.white, colors.black, math.max(1, width - 4))
-  if subtitle then
-    writeAt(monitor, x + 2, y + 3, clip(subtitle, math.max(1, width - 4)), colors.lightGray, colors.black, math.max(1, width - 4))
+  if title and #title > 0 and x2 - x1 > 4 then
+    local t = " " .. title .. " "
+    local tx = math.floor((x1 + x2 - #t) / 2)
+    writeAt(target, tx, y1, t, border, fill)
   end
 end
 
-local function drawBar(monitor, x, y, width, value, maximum, label, fillColor, emptyColor, textColor)
-  if width <= 0 then
-    return
+local function drawBar(target, x, y, width, ratio, fillColor, backColor, label)
+  ratio = clamp(ratio or 0, 0, 1)
+  local inner = math.max(0, width - 2)
+  local filled = clamp(round(inner * ratio), 0, inner)
+  writeAt(target, x, y, "[", colors.lightGray, backColor)
+  if inner > 0 then
+    local left = string.rep("=", filled)
+    local right = string.rep("-", inner - filled)
+    writeAt(target, x + 1, y, left, fillColor, backColor)
+    writeAt(target, x + 1 + filled, y, right, colors.gray, backColor)
   end
+  writeAt(target, x + width - 1, y, "]", colors.lightGray, backColor)
+  if label then
+    writeAt(target, x + 2, y, label, colors.white, backColor)
+  end
+end
 
-  fillRect(monitor, x, y, width, 1, emptyColor or colors.gray, " ")
-  value = tonumber(value) or 0
-  maximum = tonumber(maximum) or 0
-  local fill = 0
-  if maximum > 0 and value > 0 then
-    fill = math.floor((value / maximum) * width + 0.5)
-    if fill < 1 then
-      fill = 1
+local function drawParticles(mon, index)
+  local list = particles[index]
+  if not list then return end
+  local w, h = mon.getSize()
+  for i = 1, #list do
+    local p = list[i]
+    p.x = p.x + p.vx
+    p.y = p.y + p.vy
+    if p.x > w + 1 then
+      p.x = 1
+      p.y = math.random(2, h - 1)
     end
-    if fill > width then
-      fill = width
+    if p.y < 2 then p.y = h - 1 end
+    if p.y > h - 1 then p.y = 2 end
+    if math.random() < 0.02 then
+      p.color = COLOR_CYCLE[math.random(1, #COLOR_CYCLE)]
     end
-  end
-  if fill > 0 then
-    fillRect(monitor, x, y, fill, 1, fillColor or colors.green, " ")
-  end
-
-  writeAt(monitor, x + 1, y, clip(label or "", math.max(1, width - 2)), textColor or colors.white, nil, math.max(1, width - 2))
-end
-
-local function drawRows(monitor, x, y, width, height, rows, fg, bg)
-  for i = 1, math.min(height, #(rows or {})) do
-    writeAt(monitor, x, y + i - 1, padRight(clip(rows[i], width), width), fg or colors.white, bg, width)
+    writeAt(mon, math.floor(p.x), math.floor(p.y), p.glyph, p.color, colors.black)
   end
 end
 
-local function worldClock()
-  local ok, value = pcall(textutils.formatTime, os.time(), true)
-  if ok and value then
-    return value
-  end
-  return "-"
-end
-
-local function spinner()
-  local frames = { "|", "/", "-", "\\" }
-  return frames[(state.tick % #frames) + 1]
-end
-
-local function drawHeader(monitor, width, pageIndex, pageCount, title, snapshot, name)
-  fillRect(monitor, 1, 1, width, 3, colors.black, " ")
-  fillRect(monitor, 1, 1, width, 1, colors.blue, " ")
-
-  local right = "Seite " .. tostring(pageIndex) .. "/" .. tostring(pageCount) .. " | " .. worldClock()
-  local left = "LAGERNETZ // " .. tostring(title or "Monitor")
-  writeAt(monitor, 2, 1, left, colors.white, colors.blue, math.max(1, width - #right - 3))
-  writeAt(monitor, math.max(2, width - #right + 1), 1, right, colors.white, colors.blue, #right)
-
-  local line2 = "Monitor: " .. tostring(name or "-") .. " | Letzter Scan: " .. formatSince(snapshot and snapshot.time or 0) .. " | Auto: groesster Monitor"
-  local line3 = "Lokal " .. formatCompact(snapshot.localStats.totalItems) .. " | ME " .. formatCompact(snapshot.me.totalItems) .. " | Typen " .. formatCompact(snapshot.combined.uniqueItems) .. " | Strom " .. formatCompact(snapshot.energy.totalStored) .. " FE"
-  writeAt(monitor, 2, 2, clip(line2, width - 2), colors.lightGray, colors.black, width - 2)
-  writeAt(monitor, 2, 3, clip(line3, width - 2), colors.cyan, colors.black, width - 2)
-end
-
-local function drawFooter(monitor, width, height, pages, pageIndex)
-  fillRect(monitor, 1, height, width, 1, colors.black, " ")
-
-  local x = 1
-  for i, page in ipairs(pages or {}) do
-    local label = " " .. tostring(i) .. ":" .. clip(page.title, 10) .. " "
-    local bg = (i == pageIndex) and colors.orange or colors.gray
-    local fg = (i == pageIndex) and colors.black or colors.white
-    if x <= width then
-      local part = clip(label, width - x + 1)
-      fillRect(monitor, x, height, #part, 1, bg, " ")
-      writeAt(monitor, x, height, part, fg, bg, #part)
-      x = x + #part
-    end
-    if x > width then
-      break
+local function drawBigGlyph(target, x, y, ch, scale, onColor, offColor)
+  local pattern = FONT[ch] or FONT[" "]
+  local width = #pattern[1] * scale
+  for row = 1, #pattern do
+    for sy = 0, scale - 1 do
+      for col = 1, #pattern[row] do
+        local bit = pattern[row]:sub(col, col)
+        local bg = (bit == "1") and onColor or offColor
+        writeAt(target, x + (col - 1) * scale, y + (row - 1) * scale + sy, string.rep(" ", scale), onColor, bg)
+      end
     end
   end
-
-  local status = " " .. spinner() .. " stats> 'seite <n>' | geheim: 'marcel' "
-  local startX = math.max(1, width - #status + 1)
-  fillRect(monitor, startX, height, math.min(width, #status), 1, colors.blue, " ")
-  writeAt(monitor, startX, height, clip(status, width - startX + 1), colors.white, colors.blue, width - startX + 1)
+  return width
 end
 
-local function renderDashboardPage(monitor, width, height, snapshot)
-  local cardY = 4
-  local cardH = 4
-  local gap = 1
-  local cardCount = 4
-  local cardWidth = math.max(10, math.floor((width - ((cardCount - 1) * gap)) / cardCount))
+local function drawBigTime(target, x, y, timeText, scale, onColor, offColor, colonVisible)
+  local cursor = x
+  for i = 1, #timeText do
+    local ch = timeText:sub(i, i)
+    if ch == ":" and not colonVisible then ch = " " end
+    local width = drawBigGlyph(target, cursor, y, ch, scale, onColor, offColor)
+    cursor = cursor + width + scale
+  end
+end
 
-  local cards = {
-    {
-      title = "Items gesamt",
-      value = formatCompact(snapshot.combined.totalItems),
-      subtitle = "Lokal " .. formatCompact(snapshot.localStats.totalItems) .. " | ME " .. formatCompact(snapshot.me.totalItems),
-      accent = colors.green,
-    },
-    {
-      title = "Typen",
-      value = formatCompact(snapshot.combined.uniqueItems),
-      subtitle = "Mods " .. formatCompact(#snapshot.combined.modOrder),
-      accent = colors.cyan,
-    },
-    {
-      title = "ME Speicher",
-      value = snapshot.me.available and formatPercent(snapshot.me.usedItemStorage, snapshot.me.totalItemStorage) or "offline",
-      subtitle = snapshot.me.available and (formatMaybeCount(snapshot.me.usedItemStorage) .. "/" .. formatMaybeCount(snapshot.me.totalItemStorage)) or "Keine Bridge",
-      accent = colors.purple,
-    },
-    {
-      title = "Strom",
-      value = formatCompact(snapshot.energy.totalStored) .. " FE",
-      subtitle = "Use " .. formatRate(snapshot.energy.totalUsage),
-      accent = colors.red,
-    },
+local function bigTimeWidth(text, scale)
+  local total = 0
+  for i = 1, #text do
+    local ch = text:sub(i, i)
+    local pattern = FONT[ch] or FONT[" "]
+    total = total + (#pattern[1] * scale) + scale
+  end
+  return total - scale
+end
+
+local function drawFace(target, x, y, w, h, pulseColor, speaking)
+  local cx = x + math.floor(w / 2)
+  local eyeY = y + 2
+  local mouthY = y + h - 3
+  local blink = (state.frame % 26 == 0) or (state.frame % 27 == 0)
+
+  for yy = y, y + h do
+    local pad = math.abs((yy - (y + math.floor(h / 2))))
+    local inner = w - math.floor(pad / 2)
+    local startX = cx - math.floor(inner / 2)
+    local finishX = cx + math.floor(inner / 2)
+    fillRect(target, startX, yy, finishX, yy, colors.gray, " ")
+  end
+
+  writeAt(target, cx - 7, y + 1, " .------------. ", colors.lightGray, colors.black)
+  writeAt(target, cx - 7, y + h, " '------------' ", colors.lightGray, colors.black)
+
+  local eye = blink and "-" or "o"
+  writeAt(target, cx - 5, eyeY, eye, pulseColor, colors.gray)
+  writeAt(target, cx + 5, eyeY, eye, pulseColor, colors.gray)
+  writeAt(target, cx - 2, eyeY + 2, "<>", colors.white, colors.gray)
+
+  local mouth = speaking and "\\____/" or ((state.frame % 12 < 6) and "\\----/" or "\\____/")
+  writeAt(target, cx - 3, mouthY, mouth, colors.black, colors.gray)
+  writeAt(target, cx - 6, mouthY + 2, "MARCEL-O-MATIC", colors.white, colors.black)
+end
+
+local function renderLeft(monData, snap)
+  local mon = monData.obj
+  local w, h = mon.w, mon.h
+  clear(mon, colors.black)
+
+  for y = 1, h do
+    local stripe = ((y + state.frame) % 6 < 3) and colors.black or colors.gray
+    fillRect(mon, 1, y, w, y, stripe, " ")
+  end
+
+  drawParticles(mon, 1)
+  drawBox(mon, 1, 1, w, h, colors.cyan, colors.black, " CHRONO CORE ")
+
+  local scale = (w >= 72 and h >= 25) and 3 or 2
+  local timeText = snap.hm
+  local timeWidth = bigTimeWidth(timeText, scale)
+  local tx = math.floor((w - timeWidth) / 2) + 1
+  local ty = math.max(4, math.floor(h * 0.18))
+  local timeColor = (state.partyUntil > os.clock()) and COLOR_CYCLE[(state.frame % #COLOR_CYCLE) + 1] or colors.cyan
+  local offColor = colors.black
+
+  drawBigTime(mon, tx, ty, timeText, scale, timeColor, offColor, snap.second % 2 == 0)
+
+  centerWrite(mon, ty + 5 * scale + 2, snap.hms, colors.white, colors.black)
+  centerWrite(mon, ty + 5 * scale + 4, ("MC %s  |  %s  |  %d Speaker"):format(snap.gameFmt, snap.phase, #speakers), colors.lightBlue, colors.black)
+
+  local barWidth = math.min(w - 6, 50)
+  local bx = math.floor((w - barWidth) / 2) + 1
+  drawBar(mon, bx, h - 5, barWidth, snap.minuteProgress, colors.lime, colors.black, ("Minute %02d / 59"):format(snap.second))
+  centerWrite(mon, h - 3, "Touch 5x schnell fuer Party Mode", colors.gray, colors.black)
+  centerWrite(mon, h - 2, "CTRL+T beendet | ChronoShow " .. VERSION, colors.gray, colors.black)
+end
+
+local function renderRight(monData, snap)
+  local mon = monData.obj
+  local w, h = mon.w, mon.h
+  clear(mon, colors.black)
+
+  for y = 1, h do
+    local c = (y % 2 == 0) and colors.black or colors.gray
+    fillRect(mon, 1, y, w, y, c, " ")
+  end
+
+  drawParticles(mon, 2)
+  drawBox(mon, 1, 1, w, h, colors.orange, colors.black, " MARCEL TIME DECK ")
+
+  local quote = activeQuote(os.clock())
+  local quoteLines = wrapText(quote, w - 6)
+  for i = 1, math.min(2, #quoteLines) do
+    centerWrite(mon, 2 + i, quoteLines[i], COLOR_CYCLE[((state.frame + i) % #COLOR_CYCLE) + 1], colors.black)
+  end
+
+  drawBox(mon, 3, 5, w - 2, math.min(h - 11, 22), colors.lightBlue, colors.black, " STATUS FACE ")
+  local speaking = state.soundFlashUntil > os.clock()
+  local faceColor = (state.partyUntil > os.clock()) and COLOR_CYCLE[(state.frame % #COLOR_CYCLE) + 1] or colors.orange
+  drawFace(mon, 6, 8, w - 12, math.min(12, h - 18), faceColor, speaking)
+
+  local eqBaseY = math.min(h - 10, 23)
+  local eqHeight = math.max(4, math.min(10, h - eqBaseY - 6))
+  local eqLeft = 5
+  local eqRight = w - 5
+  for i = 0, 9 do
+    local x = eqLeft + i * math.floor((eqRight - eqLeft) / 10)
+    local wave = math.abs(math.sin((state.frame / 5) + (i * 0.7) + (snap.second / 10)))
+    if speaking then wave = clamp(wave + 0.35, 0, 1) end
+    if state.partyUntil > os.clock() then wave = clamp(wave + 0.20, 0, 1) end
+    local level = math.floor(wave * eqHeight)
+    for y = 0, eqHeight - 1 do
+      local color = (y < level) and COLOR_CYCLE[((i + y + state.frame) % #COLOR_CYCLE) + 1] or colors.gray
+      writeAt(mon, x, eqBaseY + eqHeight - y, " ", colors.white, color)
+    end
+  end
+
+  local panelTop = h - 8
+  drawBox(mon, 3, panelTop, w - 2, h - 1, colors.yellow, colors.black, " CLOCK DATA ")
+  writeAt(mon, 5, panelTop + 1, "Real : " .. snap.hms, colors.white, colors.black)
+  writeAt(mon, 5, panelTop + 2, "MC   : " .. snap.gameFmt .. "  (" .. snap.phase .. ")", colors.lightBlue, colors.black)
+  writeAt(mon, 5, panelTop + 3, ("Next bell in %02ds"):format(snap.nextMinute + 1), colors.lime, colors.black)
+  writeAt(mon, 5, panelTop + 4, ("Uptime %ds | Party %s"):format(snap.uptime, state.partyUntil > os.clock() and "AN" or "AUS"), colors.orange, colors.black)
+  writeAt(mon, 5, panelTop + 5, ("Monitor %s | %dx%d"):format(monData.name, monData.w, monData.h), colors.gray, colors.black)
+end
+
+local function renderSingle(monData, snap)
+  local mon = monData.obj
+  local w, h = mon.w, mon.h
+  clear(mon, colors.black)
+  drawParticles(mon, 1)
+  drawBox(mon, 1, 1, w, h, colors.cyan, colors.black, " CHRONOSHOW SINGLE ")
+
+  local scale = (w >= 72 and h >= 25) and 3 or 2
+  local timeText = snap.hm
+  local timeWidth = bigTimeWidth(timeText, scale)
+  local tx = math.floor((w - timeWidth) / 2) + 1
+  local ty = math.max(4, math.floor(h * 0.14))
+  local timeColor = (state.partyUntil > os.clock()) and COLOR_CYCLE[(state.frame % #COLOR_CYCLE) + 1] or colors.cyan
+
+  drawBigTime(mon, tx, ty, timeText, scale, timeColor, colors.black, snap.second % 2 == 0)
+  centerWrite(mon, ty + 5 * scale + 2, activeQuote(os.clock()), colors.orange, colors.black)
+  centerWrite(mon, ty + 5 * scale + 4, ("Real %s | MC %s | %s"):format(snap.hms, snap.gameFmt, snap.phase), colors.white, colors.black)
+  drawBar(mon, 4, h - 4, w - 6, snap.minuteProgress, colors.lime, colors.black, ("Minute %02d / 59"):format(snap.second))
+  centerWrite(mon, h - 2, "5x Touch = Party | " .. #speakers .. " Speaker", colors.gray, colors.black)
+end
+
+local function bootSequence()
+  for i = 1, #monitors do
+    local mon = monitors[i].obj
+    clear(mon, colors.black)
+    drawBox(mon, 1, 1, monitors[i].w, monitors[i].h, colors.cyan, colors.black, " MARCEL CHRONOSHOW BOOT ")
+    centerWrite(mon, math.floor(monitors[i].h / 2) - 2, "Synchronisiere Monitore", colors.white, colors.black)
+    drawBar(mon, 5, math.floor(monitors[i].h / 2), monitors[i].w - 8, 0, colors.lime, colors.black, "0%")
+  end
+
+  local steps = {
+    "Pruefe Monitore",
+    "Wecke Lautsprecher",
+    "Kalibriere Glocke",
+    "Starte Zeitmaschine",
+    "Fast fertig",
   }
 
-  for i, card in ipairs(cards) do
-    local x = 1 + (i - 1) * (cardWidth + gap)
-    local w = cardWidth
-    if i == #cards then
-      w = width - x + 1
+  for i = 1, #steps do
+    local ratio = i / #steps
+    for m = 1, #monitors do
+      local mon = monitors[m].obj
+      centerWrite(mon, math.floor(monitors[m].h / 2) - 1, steps[i], COLOR_CYCLE[((i + m) % #COLOR_CYCLE) + 1], colors.black)
+      drawBar(mon, 5, math.floor(monitors[m].h / 2), monitors[m].w - 8, ratio, colors.lime, colors.black, ("%d%%"):format(math.floor(ratio * 100)))
     end
-    drawCard(monitor, x, cardY, w, cardH, card.title, card.value, card.subtitle, card.accent)
+    if i == 2 and #speakers > 0 then queueTouchPling() end
+    sleep(0.28)
   end
 
-  local bodyY = cardY + cardH + 1
-  local bodyH = math.max(6, height - bodyY - 1)
-  local leftW = math.max(18, math.floor(width * 0.60))
-  local rightW = width - leftW - 1
-  local rightTopH = math.max(6, math.floor(bodyH * 0.55))
-  local rightBottomH = bodyH - rightTopH - 1
-
-  drawPanel(monitor, 1, bodyY, leftW, bodyH, "Top Items", colors.green, colors.black, colors.white)
-  local maxValue = (#snapshot.combined.order > 0 and snapshot.combined.order[1].totalCount) or 0
-  local maxRows = math.max(1, bodyH - 2)
-  for i = 1, math.min(maxRows, #snapshot.combined.order) do
-    local entry = snapshot.combined.order[i]
-    local label = tostring(i) .. ". " .. clip(entry.displayName, math.max(6, leftW - 18)) .. " " .. formatCompact(entry.totalCount)
-    drawBar(monitor, 2, bodyY + i, leftW - 2, entry.totalCount, maxValue, label, colors.green, colors.gray, colors.white)
+  if #speakers > 0 then
+    queuePartyFanfare()
   end
-  if #snapshot.combined.order == 0 then
-    writeAt(monitor, 3, bodyY + 2, "Keine Items erkannt.", colors.lightGray, colors.black, leftW - 4)
+end
+
+local function tickScheduler(snap)
+  if state.lastMinute == nil then
+    state.lastMinute = snap.minute
+    state.lastSecond = snap.second
+    return
   end
 
-  drawPanel(monitor, leftW + 2, bodyY, rightW, rightTopH, "Netzwerk", colors.cyan, colors.black, colors.white)
-  local networkRows = {
-    "Inventare: " .. formatCount(snapshot.localStats.inventoryCount),
-    "Lokale Slots: " .. formatCount(snapshot.localStats.usedSlots) .. "/" .. formatCount(snapshot.localStats.totalSlots),
-    "ME Bridge: " .. (snapshot.me.available and "online" or "offline"),
-    "Craftbar: " .. formatCount(snapshot.me.craftableCount),
-    "Fluids: " .. formatCount(snapshot.me.fluidCount),
-    "Peripherals: " .. formatCount(snapshot.peripherals.total),
-    "Monitorseiten: " .. tostring(#buildMonitorPages(snapshot)),
-  }
-  drawRows(monitor, leftW + 3, bodyY + 2, rightW - 2, rightTopH - 2, networkRows, colors.white, colors.black)
+  if snap.second ~= state.lastSecond then
+    if state.partyUntil > os.clock() and snap.second % 4 == 0 then
+      enqueue({ kind = "note", inst = "bit", vol = 0.8, pitch = 10 + (snap.second % 12), delay = 0 })
+    end
+    state.lastSecond = snap.second
+  end
 
-  if rightBottomH >= 3 then
-    drawPanel(monitor, leftW + 2, bodyY + rightTopH + 1, rightW, rightBottomH, "Aenderungen", colors.orange, colors.black, colors.white)
-    if #snapshot.changes == 0 then
-      writeAt(monitor, leftW + 3, bodyY + rightTopH + 3, "Keine Aenderungen seit dem letzten Scan.", colors.lightGray, colors.black, rightW - 2)
+  if snap.minute ~= state.lastMinute then
+    if snap.hour == 13 and snap.minute == 37 then
+      startParty("MARCEL MODE 13:37")
+    end
+
+    if snap.minute == 0 and CONFIG.hourChime then
+      queueHourChime(snap.hour)
+    elseif snap.minute % 15 == 0 and CONFIG.quarterChime then
+      local quarter = math.floor(snap.minute / 15)
+      queueQuarterChime(quarter)
+    elseif CONFIG.minuteChime then
+      queueMinuteChime()
+    end
+
+    state.lastMinute = snap.minute
+  end
+end
+
+local function renderLoop()
+  while true do
+    state.frame = state.frame + 1
+    local snap = getClockSnapshot()
+    tickScheduler(snap)
+
+    if #monitors == 0 then
+      term.setBackgroundColor(colors.black)
+      term.clear()
+      term.setCursorPos(1, 1)
+      term.setTextColor(colors.red)
+      print("Keine Monitore gefunden.")
+      print("Bitte 2 Monitore und Speaker ans Modem-Netz haengen.")
+      sleep(2)
+    elseif #monitors == 1 then
+      renderSingle(monitors[1], snap)
+      sleep(CONFIG.frameDelay)
     else
-      for i = 1, math.min(rightBottomH - 2, #snapshot.changes) do
-        local entry = snapshot.changes[i]
-        local prefix = entry.delta > 0 and "+" or ""
-        local row = tostring(i) .. ". " .. clip(entry.displayName, math.max(6, rightW - 16)) .. " " .. prefix .. formatCompact(entry.delta)
-        local fg = entry.delta >= 0 and colors.lime or colors.red
-        writeAt(monitor, leftW + 3, bodyY + rightTopH + 1 + i, row, fg, colors.black, rightW - 2)
-      end
+      renderLeft(monitors[1], snap)
+      renderRight(monitors[2], snap)
+      sleep(CONFIG.frameDelay)
     end
   end
 end
 
-local function renderItemsPage(monitor, width, height, snapshot)
-  local topY = 4
-  local topH = math.max(6, height - topY - 1)
-  local leftW = math.max(20, math.floor(width * 0.63))
-  local rightW = width - leftW - 1
-
-  drawPanel(monitor, 1, topY, leftW, topH, "Top Items im ganzen Netzwerk", colors.green, colors.black, colors.white)
-  if #snapshot.combined.order == 0 then
-    writeAt(monitor, 3, topY + 2, "Keine Items gefunden.", colors.lightGray, colors.black, leftW - 4)
-  else
-    local maxValue = snapshot.combined.order[1].totalCount or 0
-    for i = 1, math.min(topH - 2, #snapshot.combined.order) do
-      local entry = snapshot.combined.order[i]
-      local tag = ""
-      if entry.localCount > 0 and entry.meCount > 0 then
-        tag = " L/ME"
-      elseif entry.meCount > 0 then
-        tag = " ME"
-      else
-        tag = " L"
-      end
-      local label = tostring(i) .. ". " .. clip(entry.displayName, math.max(8, leftW - 20)) .. " " .. formatCompact(entry.totalCount) .. tag
-      drawBar(monitor, 2, topY + i, leftW - 2, entry.totalCount, maxValue, label, colors.green, colors.gray, colors.white)
-    end
-  end
-
-  local upperH = math.max(7, math.floor(topH * 0.52))
-  drawPanel(monitor, leftW + 2, topY, rightW, upperH, "Top Mods", colors.purple, colors.black, colors.white)
-  if #snapshot.combined.modOrder == 0 then
-    writeAt(monitor, leftW + 3, topY + 2, "Keine Mod-Daten.", colors.lightGray, colors.black, rightW - 2)
-  else
-    local modMax = snapshot.combined.modOrder[1].count or 0
-    for i = 1, math.min(upperH - 2, #snapshot.combined.modOrder) do
-      local entry = snapshot.combined.modOrder[i]
-      local label = tostring(i) .. ". " .. clip(entry.label, math.max(8, rightW - 16)) .. " " .. formatCompact(entry.count)
-      drawBar(monitor, leftW + 3, topY + i, rightW - 2, entry.count, modMax, label, colors.purple, colors.gray, colors.white)
-    end
-  end
-
-  local bottomY = topY + upperH + 1
-  local bottomH = topH - upperH - 1
-  if bottomH >= 3 then
-    drawPanel(monitor, leftW + 2, bottomY, rightW, bottomH, "Schnelle Fakten", colors.cyan, colors.black, colors.white)
-    local facts = {
-      "Lokale Items: " .. formatCount(snapshot.localStats.totalItems),
-      "ME Items: " .. formatCount(snapshot.me.totalItems),
-      "Freie Slots: " .. formatCount(snapshot.localStats.freeSlots),
-      "ME Craftbar: " .. formatCount(snapshot.me.craftableCount),
-      "Fluids: " .. formatCount(snapshot.me.fluidCount),
-      "Stromquellen: " .. formatCount(#snapshot.energy.sources),
-    }
-    drawRows(monitor, leftW + 3, bottomY + 2, rightW - 2, bottomH - 2, facts, colors.white, colors.black)
-  end
-end
-
-local function renderStoragePage(monitor, width, height, snapshot)
-  local cardY = 4
-  local cardH = 4
-  local gap = 1
-  local cardCount = 3
-  local cardWidth = math.max(12, math.floor((width - ((cardCount - 1) * gap)) / cardCount))
-  local topInv = snapshot.localStats.inventories[1]
-
-  local cards = {
-    {
-      title = "Inventare",
-      value = formatCount(snapshot.localStats.inventoryCount),
-      subtitle = "lokal verbunden",
-      accent = colors.cyan,
-    },
-    {
-      title = "Slots",
-      value = formatPercent(snapshot.localStats.usedSlots, snapshot.localStats.totalSlots),
-      subtitle = formatCount(snapshot.localStats.usedSlots) .. "/" .. formatCount(snapshot.localStats.totalSlots),
-      accent = colors.orange,
-    },
-    {
-      title = "Groesstes Lager",
-      value = topInv and formatCompact(topInv.totalItems) or "-",
-      subtitle = topInv and clip(topInv.name, math.max(8, cardWidth - 4)) or "kein Inventar",
-      accent = colors.green,
-    },
-  }
-
-  for i, card in ipairs(cards) do
-    local x = 1 + (i - 1) * (cardWidth + gap)
-    local w = cardWidth
-    if i == #cards then
-      w = width - x + 1
-    end
-    drawCard(monitor, x, cardY, w, cardH, card.title, card.value, card.subtitle, card.accent)
-  end
-
-  local bodyY = cardY + cardH + 1
-  local bodyH = math.max(6, height - bodyY - 1)
-  local leftW = math.max(20, math.floor(width * 0.58))
-  local rightW = width - leftW - 1
-
-  drawPanel(monitor, 1, bodyY, leftW, bodyH, "Inventar-Auslastung", colors.cyan, colors.black, colors.white)
-  if #snapshot.localStats.inventories == 0 then
-    writeAt(monitor, 3, bodyY + 2, "Keine lokalen Inventare erkannt.", colors.lightGray, colors.black, leftW - 4)
-  else
-    local maxItems = snapshot.localStats.inventories[1].totalItems or 0
-    for i = 1, math.min(bodyH - 2, #snapshot.localStats.inventories) do
-      local inv = snapshot.localStats.inventories[i]
-      local label = tostring(i) .. ". " .. clip(inv.name, math.max(8, leftW - 24)) .. " " .. formatCompact(inv.totalItems) .. " / " .. formatPercent(inv.usedSlots, inv.size)
-      drawBar(monitor, 2, bodyY + i, leftW - 2, inv.totalItems, maxItems, label, colors.cyan, colors.gray, colors.white)
-    end
-  end
-
-  local upperH = math.max(6, math.floor(bodyH * 0.52))
-  drawPanel(monitor, leftW + 2, bodyY, rightW, upperH, "Mod-Verteilung", colors.purple, colors.black, colors.white)
-  if #snapshot.combined.modOrder == 0 then
-    writeAt(monitor, leftW + 3, bodyY + 2, "Keine Mods erkannt.", colors.lightGray, colors.black, rightW - 2)
-  else
-    local modMax = snapshot.combined.modOrder[1].count or 0
-    for i = 1, math.min(upperH - 2, #snapshot.combined.modOrder) do
-      local entry = snapshot.combined.modOrder[i]
-      local label = tostring(i) .. ". " .. clip(entry.label, math.max(8, rightW - 16)) .. " " .. formatCompact(entry.count)
-      drawBar(monitor, leftW + 3, bodyY + i, rightW - 2, entry.count, modMax, label, colors.purple, colors.gray, colors.white)
-    end
-  end
-
-  local bottomY = bodyY + upperH + 1
-  local bottomH = bodyH - upperH - 1
-  if bottomH >= 3 then
-    drawPanel(monitor, leftW + 2, bottomY, rightW, bottomH, "Peripherals", colors.orange, colors.black, colors.white)
-    local rows = {
-      "Gesamt: " .. formatCount(snapshot.peripherals.total),
-      "Inventare: " .. formatCount(snapshot.peripherals.inventory),
-      "Monitore: " .. formatCount(snapshot.peripherals.monitor),
-      "ME Bridges: " .. formatCount(snapshot.peripherals.meBridge),
-      "Speaker: " .. formatCount(snapshot.peripherals.speaker),
-      "Stromdaten: " .. formatCount(snapshot.peripherals.energy),
-    }
-    drawRows(monitor, leftW + 3, bottomY + 2, rightW - 2, bottomH - 2, rows, colors.white, colors.black)
-  end
-end
-
-local function renderMePage(monitor, width, height, snapshot)
-  local me = snapshot.me
-  if not me.available then
-    drawPanel(monitor, 1, 4, width, height - 4, "ME System", colors.purple, colors.black, colors.white)
-    writeAt(monitor, 4, 7, "Keine ME Bridge gefunden.", colors.white, colors.black, width - 6)
-    writeAt(monitor, 4, 9, "Befehle: mebridge auto  |  mebridge <name>", colors.lightGray, colors.black, width - 6)
-    writeAt(monitor, 4, 11, "Sobald eine Bridge gefunden wird, erscheinen hier", colors.lightGray, colors.black, width - 6)
-    writeAt(monitor, 4, 12, "Items, Fluids, Speicher, Craftables und Energie.", colors.lightGray, colors.black, width - 6)
-    return
-  end
-
-  local cardY = 4
-  local cardH = 4
-  local gap = 1
-  local cardCount = 4
-  local cardWidth = math.max(10, math.floor((width - ((cardCount - 1) * gap)) / cardCount))
-  local cards = {
-    {
-      title = "ME Items",
-      value = formatCompact(me.totalItems),
-      subtitle = formatCount(me.uniqueItems) .. " Typen",
-      accent = colors.purple,
-    },
-    {
-      title = "Craftbar",
-      value = formatCompact(me.craftableCount),
-      subtitle = "Rezepte / Ziele",
-      accent = colors.cyan,
-    },
-    {
-      title = "Fluids",
-      value = formatCompact(me.fluidCount),
-      subtitle = formatCompact(me.fluidTotal) .. " Menge",
-      accent = colors.blue,
-    },
-    {
-      title = "ME Energie",
-      value = formatCompact(me.energyStorage) .. " FE",
-      subtitle = "Use " .. formatRate(me.energyUsage),
-      accent = colors.red,
-    },
-  }
-
-  for i, card in ipairs(cards) do
-    local x = 1 + (i - 1) * (cardWidth + gap)
-    local w = cardWidth
-    if i == #cards then
-      w = width - x + 1
-    end
-    drawCard(monitor, x, cardY, w, cardH, card.title, card.value, card.subtitle, card.accent)
-  end
-
-  local bodyY = cardY + cardH + 1
-  local bodyH = math.max(6, height - bodyY - 1)
-  local leftW = math.max(20, math.floor(width * 0.58))
-  local rightW = width - leftW - 1
-
-  drawPanel(monitor, 1, bodyY, leftW, bodyH, "ME Top Items", colors.purple, colors.black, colors.white)
-  if #me.order == 0 then
-    writeAt(monitor, 3, bodyY + 2, "Keine Items im ME System.", colors.lightGray, colors.black, leftW - 4)
-  else
-    local maxValue = me.order[1].meCount or me.order[1].totalCount or 0
-    for i = 1, math.min(bodyH - 2, #me.order) do
-      local entry = me.order[i]
-      local amount = entry.meCount or entry.totalCount or 0
-      local label = tostring(i) .. ". " .. clip(entry.displayName, math.max(8, leftW - 18)) .. " " .. formatCompact(amount)
-      drawBar(monitor, 2, bodyY + i, leftW - 2, amount, maxValue, label, colors.purple, colors.gray, colors.white)
-    end
-  end
-
-  local rightTopH = math.max(6, math.floor(bodyH * 0.52))
-  drawPanel(monitor, leftW + 2, bodyY, rightW, rightTopH, "Fluids", colors.blue, colors.black, colors.white)
-  if #me.fluids == 0 then
-    writeAt(monitor, leftW + 3, bodyY + 2, "Keine Fluids erkannt.", colors.lightGray, colors.black, rightW - 2)
-  else
-    local maxFluid = me.fluids[1].amount or 0
-    for i = 1, math.min(rightTopH - 2, #me.fluids) do
-      local fluid = me.fluids[i]
-      local label = tostring(i) .. ". " .. clip(fluid.displayName, math.max(8, rightW - 16)) .. " " .. formatCompact(fluid.amount)
-      drawBar(monitor, leftW + 3, bodyY + i, rightW - 2, fluid.amount, maxFluid, label, colors.blue, colors.gray, colors.white)
-    end
-  end
-
-  local bottomY = bodyY + rightTopH + 1
-  local bottomH = bodyH - rightTopH - 1
-  if bottomH >= 3 then
-    drawPanel(monitor, leftW + 2, bottomY, rightW, bottomH, "ME Status", colors.red, colors.black, colors.white)
-    local rows = {
-      "Bridge: " .. me.name,
-      "Item-Speicher: " .. formatMaybeCount(me.usedItemStorage) .. "/" .. formatMaybeCount(me.totalItemStorage),
-      "Fluid-Speicher: " .. formatMaybeCount(me.usedFluidStorage) .. "/" .. formatMaybeCount(me.totalFluidStorage),
-      "Zellen: " .. formatCount(me.cellCount),
-      "CPUs: " .. formatCount(me.cpuCount),
-      "Craftbar: " .. formatCount(me.craftableCount),
-    }
-    drawRows(monitor, leftW + 3, bottomY + 2, rightW - 2, bottomH - 2, rows, colors.white, colors.black)
-  end
-end
-
-local function renderEnergyPage(monitor, width, height, snapshot)
-  local cardY = 4
-  local cardH = 4
-  local gap = 1
-  local cardCount = 4
-  local cardWidth = math.max(10, math.floor((width - ((cardCount - 1) * gap)) / cardCount))
-  local cards = {
-    {
-      title = "Gespeichert",
-      value = formatCompact(snapshot.energy.totalStored) .. " FE",
-      subtitle = formatCompact(snapshot.energy.totalCapacity) .. " FE max",
-      accent = colors.red,
-    },
-    {
-      title = "Transfer",
-      value = formatCompact(snapshot.energy.totalRate) .. " FE/t",
-      subtitle = "gemessen",
-      accent = colors.orange,
-    },
-    {
-      title = "Verbrauch",
-      value = formatCompact(snapshot.energy.totalUsage) .. " FE/t",
-      subtitle = "gesamt",
-      accent = colors.purple,
-    },
-    {
-      title = "Quellen",
-      value = formatCount(#snapshot.energy.sources),
-      subtitle = "mit Stromdaten",
-      accent = colors.cyan,
-    },
-  }
-
-  for i, card in ipairs(cards) do
-    local x = 1 + (i - 1) * (cardWidth + gap)
-    local w = cardWidth
-    if i == #cards then
-      w = width - x + 1
-    end
-    drawCard(monitor, x, cardY, w, cardH, card.title, card.value, card.subtitle, card.accent)
-  end
-
-  local bodyY = cardY + cardH + 1
-  local bodyH = math.max(6, height - bodyY - 1)
-  local leftW = math.max(22, math.floor(width * 0.66))
-  local rightW = width - leftW - 1
-
-  drawPanel(monitor, 1, bodyY, leftW, bodyH, "Energiequellen", colors.red, colors.black, colors.white)
-  if #snapshot.energy.sources == 0 then
-    writeAt(monitor, 3, bodyY + 2, "Keine Stromdaten gefunden.", colors.lightGray, colors.black, leftW - 4)
-    writeAt(monitor, 3, bodyY + 4, "Tipp: Energy Detector oder ME Bridge anschliessen.", colors.lightGray, colors.black, leftW - 4)
-  else
-    local maxRate = 1
-    for _, src in ipairs(snapshot.energy.sources) do
-      local candidate = math.abs(src.rate or src.usage or src.stored or 0)
-      if candidate > maxRate then
-        maxRate = candidate
-      end
-    end
-
-    for i = 1, math.min(bodyH - 2, #snapshot.energy.sources) do
-      local src = snapshot.energy.sources[i]
-      local metric = math.abs(src.rate or src.usage or src.stored or 0)
-      local info = src.rate and formatRate(src.rate) or (src.usage and ("Use " .. formatRate(src.usage)) or formatEnergy(src.stored, src.capacity))
-      local label = tostring(i) .. ". " .. clip(src.name, math.max(8, leftW - 22)) .. " " .. info
-      drawBar(monitor, 2, bodyY + i, leftW - 2, metric, maxRate, label, colors.red, colors.gray, colors.white)
-    end
-  end
-
-  local upperH = math.max(6, math.floor(bodyH * 0.50))
-  drawPanel(monitor, leftW + 2, bodyY, rightW, upperH, "Delta", colors.orange, colors.black, colors.white)
-  if #snapshot.changes == 0 then
-    writeAt(monitor, leftW + 3, bodyY + 2, "Keine Aenderungen.", colors.lightGray, colors.black, rightW - 2)
-  else
-    for i = 1, math.min(upperH - 2, #snapshot.changes) do
-      local entry = snapshot.changes[i]
-      local prefix = entry.delta > 0 and "+" or ""
-      local fg = entry.delta >= 0 and colors.lime or colors.red
-      local row = tostring(i) .. ". " .. clip(entry.displayName, math.max(8, rightW - 16)) .. " " .. prefix .. formatCompact(entry.delta)
-      writeAt(monitor, leftW + 3, bodyY + 1 + i, row, fg, colors.black, rightW - 2)
-    end
-  end
-
-  local bottomY = bodyY + upperH + 1
-  local bottomH = bodyH - upperH - 1
-  if bottomH >= 3 then
-    drawPanel(monitor, leftW + 2, bottomY, rightW, bottomH, "Live Hinweise", colors.cyan, colors.black, colors.white)
-    local rows = {
-      "Scan-Intervall: " .. tostring(state.config.scanInterval) .. "s",
-      "Seitenwechsel: " .. tostring(state.config.pageInterval) .. "s",
-      "Speaker: " .. (resolveSpeakerName() or "nicht gefunden"),
-      "ME Bridge: " .. (snapshot.me.available and "online" or "offline"),
-      "Monitor: " .. tostring(snapshot.monitorName or "-"),
-    }
-    drawRows(monitor, leftW + 3, bottomY + 2, rightW - 2, bottomH - 2, rows, colors.white, colors.black)
-  end
-end
-
-local function renderChangesPage(monitor, width, height, snapshot)
-  local topY = 4
-  local boxH = math.max(6, height - topY - 1)
-  local leftW = math.max(22, math.floor(width * 0.60))
-  local rightW = width - leftW - 1
-
-  drawPanel(monitor, 1, topY, leftW, boxH, "Aenderungen seit letztem Scan", colors.orange, colors.black, colors.white)
-  if #snapshot.changes == 0 then
-    writeAt(monitor, 3, topY + 2, "Keine Aenderungen erkannt.", colors.lightGray, colors.black, leftW - 4)
-  else
-    local maxDelta = 1
-    for _, entry in ipairs(snapshot.changes) do
-      local value = math.abs(entry.delta or 0)
-      if value > maxDelta then
-        maxDelta = value
-      end
-    end
-
-    for i = 1, math.min(boxH - 2, #snapshot.changes) do
-      local entry = snapshot.changes[i]
-      local label = tostring(i) .. ". " .. clip(entry.displayName, math.max(8, leftW - 20)) .. " " .. (entry.delta > 0 and "+" or "") .. formatCompact(entry.delta)
-      local color = entry.delta >= 0 and colors.lime or colors.red
-      drawBar(monitor, 2, topY + i, leftW - 2, math.abs(entry.delta), maxDelta, label, color, colors.gray, colors.white)
-    end
-  end
-
-  drawPanel(monitor, leftW + 2, topY, rightW, boxH, "Kurzstatus", colors.cyan, colors.black, colors.white)
-  local topMod = snapshot.combined.modOrder[1]
-  local topItem = snapshot.combined.order[1]
-  local rows = {
-    "Gesamtitems: " .. formatCount(snapshot.combined.totalItems),
-    "Typen: " .. formatCount(snapshot.combined.uniqueItems),
-    "Top Mod: " .. (topMod and topMod.label or "-"),
-    "Top Item: " .. (topItem and topItem.displayName or "-"),
-    "ME online: " .. (snapshot.me.available and "ja" or "nein"),
-    "Energiequellen: " .. formatCount(#snapshot.energy.sources),
-    "Kekse im Netz: " .. formatCount(countMatchingItems(snapshot, { "cookie", "keks" })),
-    "Kuchen im Netz: " .. formatCount(countMatchingItems(snapshot, { "cake", "kuchen" })),
-  }
-  drawRows(monitor, leftW + 3, topY + 2, rightW - 2, boxH - 2, rows, colors.white, colors.black)
-end
-
-local function renderEasterPage(monitor, width, height, snapshot)
-  fillRect(monitor, 1, 4, width, height - 4, colors.black, " ")
-  local panelY = 5
-  local panelH = math.max(8, height - panelY - 1)
-  drawPanel(monitor, 2, panelY, width - 2, panelH, "Marcel-Modus", colors.magenta, colors.black, colors.white)
-
-  local cookieCount = countMatchingItems(snapshot, { "cookie", "keks" })
-  local cakeCount = countMatchingItems(snapshot, { "cake", "kuchen" })
-  local topMod = snapshot.combined.modOrder[1] and snapshot.combined.modOrder[1].label or "-"
-  local bridgeStatus = snapshot.me.available and "ME online" or "ME offline"
-
-  local art = {
-    "   __  __                       _ ",
-    "  / /_/ /  ATL10 Lagerkern    (_)",
-    " / __/ _ \\  Alles im Blick    / / ",
-    "/_/ /_//_/  Marcel-Modus     /_/  ",
-    "",
-    "Kekse im Netz : " .. formatCount(cookieCount),
-    "Kuchen im Netz: " .. formatCount(cakeCount),
-    "Lieblings-Mod : " .. topMod,
-    "Bridge-Status : " .. bridgeStatus,
-    "Top Item      : " .. ((snapshot.combined.order[1] and snapshot.combined.order[1].displayName) or "-"),
-    "",
-    "Tipp: 'marcel' schaltet dieses Easteregg wieder aus.",
-  }
-
-  local startY = panelY + 2
-  for i, line in ipairs(art) do
-    if startY + i - 1 >= height then
-      break
-    end
-    local fg = (i <= 4) and colors.magenta or colors.white
-    if line == "" then
-      fg = colors.black
-    end
-    writeAt(monitor, 5, startY + i - 1, clip(line, width - 8), fg, colors.black, width - 8)
-  end
-end
-
-local function renderLargeMonitor(monitor, name, width, height, pages, page)
-  drawHeader(monitor, width, state.page, #pages, page.title, state.snapshot, name)
-
-  if page.kind == "dashboard" then
-    renderDashboardPage(monitor, width, height, state.snapshot)
-  elseif page.kind == "items" then
-    renderItemsPage(monitor, width, height, state.snapshot)
-  elseif page.kind == "storage" then
-    renderStoragePage(monitor, width, height, state.snapshot)
-  elseif page.kind == "me" then
-    renderMePage(monitor, width, height, state.snapshot)
-  elseif page.kind == "energy" then
-    renderEnergyPage(monitor, width, height, state.snapshot)
-  elseif page.kind == "changes" then
-    renderChangesPage(monitor, width, height, state.snapshot)
-  elseif page.kind == "easter" then
-    renderEasterPage(monitor, width, height, state.snapshot)
-  else
-    drawPanel(monitor, 1, 4, width, height - 4, page.title, colors.blue, colors.black, colors.white)
-    drawRows(monitor, 3, 6, width - 4, height - 8, page.lines or {}, colors.white, colors.black)
-  end
-
-  drawFooter(monitor, width, height, pages, state.page)
-end
-
-local function renderSmallMonitor(monitor, name, width, height, pages, page)
-  local y = 1
-
-  local function monLine(text, color)
-    if y > height then
-      return
-    end
-    writeAt(monitor, 1, y, padRight(clip(text, width), width), color or colors.white, colors.black, width)
-    y = y + 1
-  end
-
-  monLine("Lager Statistik - " .. page.title, colors.cyan)
-  monLine("Monitor: " .. name .. " | Seite " .. tostring(state.page) .. "/" .. tostring(#pages), colors.lightGray)
-
-  for _, line in ipairs(page.lines or {}) do
-    if y > height then
-      break
-    end
-    monLine(line, colors.white)
-  end
-end
-
-local function renderMonitor()
-  local monitor, name = currentMonitor()
-  if not monitor then
-    return
-  end
-
-  local scale = tonumber(state.config.monitorScale) or DEFAULT_MONITOR_SCALE
-  pcall(monitor.setTextScale, scale)
-  pcall(monitor.setBackgroundColor, colors.black)
-  pcall(monitor.setTextColor, colors.white)
-  pcall(monitor.clear)
-  pcall(monitor.setCursorPos, 1, 1)
-
-  local width, height = monitorSize(monitor)
-  local pages = buildMonitorPages(state.snapshot)
-  if #pages == 0 then
-    return
-  end
-
-  if state.page < 1 then
-    state.page = 1
-  end
-  if state.page > #pages then
-    state.page = 1
-  end
-
-  local page = pages[state.page]
-
-  if isLargeMonitor(width, height) and state.snapshot then
-    renderLargeMonitor(monitor, name, width, height, pages, page)
-  else
-    renderSmallMonitor(monitor, name, width, height, pages, page)
-  end
-end
-
-local function printSection(title)
-  print("")
-  print("=== " .. title .. " ===")
-end
-
-local function showStatus()
-  local snapshot = state.snapshot
-  if not snapshot then
-    print("Noch kein Scan vorhanden.")
-    return
-  end
-
-  printSection("Uebersicht")
-  print("Lokale Inventare: " .. formatCount(snapshot.localStats.inventoryCount))
-  print("Lokale Slots:     " .. formatCount(snapshot.localStats.usedSlots) .. "/" .. formatCount(snapshot.localStats.totalSlots) .. " (" .. formatPercent(snapshot.localStats.usedSlots, snapshot.localStats.totalSlots) .. ")")
-  print("Lokale Items:     " .. formatCount(snapshot.localStats.totalItems))
-  print("Lokale Typen:     " .. formatCount(snapshot.localStats.uniqueItems))
-  print("ME Bridge:        " .. (snapshot.me.available and snapshot.me.name or "nicht gefunden"))
-  print("ME Items:         " .. formatCount(snapshot.me.totalItems))
-  print("ME Typen:         " .. formatCount(snapshot.me.uniqueItems))
-  print("ME craftbar:      " .. formatCount(snapshot.me.craftableCount))
-  print("Kombi Items:      " .. formatCount(snapshot.combined.totalItems))
-  print("Kombi Typen:      " .. formatCount(snapshot.combined.uniqueItems))
-  print("Sortierung:       " .. ((snapshot.support and snapshot.support.enabled) and "AN" or "AUS"))
-  print("Vaults:           " .. formatCount((snapshot.support and snapshot.support.vaultCount) or 0))
-  print("Controller:       " .. ((snapshot.support and snapshot.support.priorityName) or "nicht gesetzt"))
-  print("Zuletzt Ctrl:     " .. formatCount((snapshot.support and snapshot.support.lastMovedPriority) or 0))
-  print("In Vaults:        " .. formatCount((snapshot.support and snapshot.support.lastStayed) or 0))
-  print("Zuletzt bewegt:   " .. formatCount((snapshot.support and snapshot.support.lastMoved) or 0))
-  print("Energie-Quellen:  " .. formatCount(#snapshot.energy.sources))
-  print("Letzter Scan:     " .. formatSince(snapshot.time))
-end
-
-local function showTop(limit)
-  local snapshot = state.snapshot
-  if not snapshot then
-    print("Noch kein Scan vorhanden.")
-    return
-  end
-
-  limit = math.max(1, math.floor(tonumber(limit) or 15))
-  printSection("Top Items")
-
-  if #snapshot.combined.order == 0 then
-    print("Keine Items gefunden.")
-    return
-  end
-
-  for i = 1, math.min(limit, #snapshot.combined.order) do
-    local entry = snapshot.combined.order[i]
-    local line = string.format("%2d) %s = %s", i, entry.displayName, formatCount(entry.totalCount))
-    if entry.localCount > 0 or entry.meCount > 0 then
-      line = line .. " | Lokal " .. formatCount(entry.localCount) .. " | ME " .. formatCount(entry.meCount)
-    end
-    print(line)
-  end
-end
-
-local function showMods(limit)
-  local snapshot = state.snapshot
-  if not snapshot then
-    print("Noch kein Scan vorhanden.")
-    return
-  end
-
-  limit = math.max(1, math.floor(tonumber(limit) or 15))
-  printSection("Mod Statistik")
-
-  if #snapshot.combined.modOrder == 0 then
-    print("Keine Mod-Daten gefunden.")
-    return
-  end
-
-  for i = 1, math.min(limit, #snapshot.combined.modOrder) do
-    local entry = snapshot.combined.modOrder[i]
-    print(string.format("%2d) %s = %s", i, entry.label, formatCount(entry.count)))
-  end
-end
-
-local function showInventories(limit)
-  local snapshot = state.snapshot
-  if not snapshot then
-    print("Noch kein Scan vorhanden.")
-    return
-  end
-
-  limit = math.max(1, math.floor(tonumber(limit) or 15))
-  printSection("Lokale Inventare")
-
-  if #snapshot.localStats.inventories == 0 then
-    print("Keine lokalen Inventare gefunden.")
-    return
-  end
-
-  for i = 1, math.min(limit, #snapshot.localStats.inventories) do
-    local inv = snapshot.localStats.inventories[i]
-    print(string.format("%2d) %s", i, inv.name))
-    print("    Typen:  " .. inv.types)
-    print("    Items:  " .. formatCount(inv.totalItems))
-    print("    Slots:  " .. formatCount(inv.usedSlots) .. "/" .. formatCount(inv.size) .. " (frei " .. formatCount(inv.freeSlots) .. ")")
-  end
-end
-
-local function showMe()
-  local snapshot = state.snapshot
-  if not snapshot then
-    print("Noch kein Scan vorhanden.")
-    return
-  end
-
-  printSection("ME System")
-  if not snapshot.me.available then
-    print("Keine ME Bridge gefunden.")
-    return
-  end
-
-  local me = snapshot.me
-  print("Bridge:           " .. me.name)
-  print("Items gesamt:     " .. formatCount(me.totalItems))
-  print("Item-Typen:       " .. formatCount(me.uniqueItems))
-  print("Craftbar:         " .. formatCount(me.craftableCount))
-  print("Fluids:           " .. formatCount(me.fluidCount) .. " Typen / " .. formatCount(me.fluidTotal) .. " Menge")
-  print("Item-Speicher:    " .. formatMaybeCount(me.usedItemStorage) .. "/" .. formatMaybeCount(me.totalItemStorage))
-  print("Fluid-Speicher:   " .. formatMaybeCount(me.usedFluidStorage) .. "/" .. formatMaybeCount(me.totalFluidStorage))
-  print("Energie:          " .. formatEnergy(me.energyStorage, me.maxEnergyStorage))
-  print("Verbrauch:        " .. formatRate(me.energyUsage))
-  print("Zellen:           " .. formatCount(me.cellCount))
-  print("CPUs:             " .. formatCount(me.cpuCount))
-end
-
-local function showFluids(limit)
-  local snapshot = state.snapshot
-  if not snapshot then
-    print("Noch kein Scan vorhanden.")
-    return
-  end
-
-  limit = math.max(1, math.floor(tonumber(limit) or 15))
-  printSection("ME Fluids")
-
-  if not snapshot.me.available then
-    print("Keine ME Bridge gefunden.")
-    return
-  end
-
-  if #snapshot.me.fluids == 0 then
-    print("Keine Fluids gefunden.")
-    return
-  end
-
-  for i = 1, math.min(limit, #snapshot.me.fluids) do
-    local fluid = snapshot.me.fluids[i]
-    print(string.format("%2d) %s = %s", i, fluid.displayName, formatCount(fluid.amount)))
-  end
-end
-
-local function showCraftables(limit)
-  local snapshot = state.snapshot
-  if not snapshot then
-    print("Noch kein Scan vorhanden.")
-    return
-  end
-
-  limit = math.max(1, math.floor(tonumber(limit) or 20))
-  printSection("ME Craftables")
-
-  if not snapshot.me.available then
-    print("Keine ME Bridge gefunden.")
-    return
-  end
-
-  if #snapshot.me.craftables == 0 then
-    print("Keine craftbaren Items gefunden.")
-    return
-  end
-
-  for i = 1, math.min(limit, #snapshot.me.craftables) do
-    local item = snapshot.me.craftables[i]
-    print(string.format("%2d) %s", i, item.displayName))
-  end
-end
-
-local function showEnergy()
-  local snapshot = state.snapshot
-  if not snapshot then
-    print("Noch kein Scan vorhanden.")
-    return
-  end
-
-  printSection("Strom")
-  if #snapshot.energy.sources == 0 then
-    print("Keine Stromquellen erkannt.")
-    print("Tipp: Energy Detector oder ME Bridge nutzen.")
-    return
-  end
-
-  print("Gespeichert: " .. formatEnergy(snapshot.energy.totalStored, snapshot.energy.totalCapacity))
-  print("Transfer:    " .. formatRate(snapshot.energy.totalRate))
-  print("Verbrauch:   " .. formatRate(snapshot.energy.totalUsage))
-  print("")
-
-  for i, src in ipairs(snapshot.energy.sources) do
-    print(string.format("%2d) %s", i, src.name))
-    print("    Typen:      " .. src.types)
-    print("    Gespeichert:" .. " " .. formatEnergy(src.stored, src.capacity))
-    print("    Transfer:   " .. formatRate(src.rate))
-    print("    Verbrauch:  " .. formatRate(src.usage))
-  end
-end
-
-local function showPeripherals()
-  local snapshot = state.snapshot
-  if not snapshot then
-    print("Noch kein Scan vorhanden.")
-    return
-  end
-
-  printSection("Peripherals")
-  print("Gesamt:     " .. formatCount(snapshot.peripherals.total))
-  print("Inventare:  " .. formatCount(snapshot.peripherals.inventory))
-  print("Monitore:   " .. formatCount(snapshot.peripherals.monitor))
-  print("ME Bridge:  " .. formatCount(snapshot.peripherals.meBridge))
-  print("Modems:     " .. formatCount(snapshot.peripherals.modem))
-  print("Speaker:    " .. formatCount(snapshot.peripherals.speaker))
-  print("Stromdaten: " .. formatCount(snapshot.peripherals.energy))
-  print("")
-
-  for i, entry in ipairs(snapshot.peripherals.list) do
-    print(string.format("%2d) %s [%s]", i, entry.name, entry.types))
-  end
-end
-
-local function showChanges(limit)
-  local snapshot = state.snapshot
-  if not snapshot then
-    print("Noch kein Scan vorhanden.")
-    return
-  end
-
-  limit = math.max(1, math.floor(tonumber(limit) or 15))
-  printSection("Aenderungen seit letztem Scan")
-
-  if #snapshot.changes == 0 then
-    print("Keine Aenderungen erkannt.")
-    return
-  end
-
-  for i = 1, math.min(limit, #snapshot.changes) do
-    local entry = snapshot.changes[i]
-    local prefix = entry.delta > 0 and "+" or ""
-    print(string.format("%2d) %s: %s%s (vorher %s, jetzt %s)", i, entry.displayName, prefix, formatCount(entry.delta), formatCount(entry.before), formatCount(entry.after)))
-  end
-end
-
-local function showFind(term)
-  local snapshot = state.snapshot
-  if not snapshot then
-    print("Noch kein Scan vorhanden.")
-    return
-  end
-
-  term = trim(term):lower()
-  if term == "" then
-    print("Bitte Suchbegriff angeben.")
-    return
-  end
-
-  printSection("Suche: " .. term)
-  local found = 0
-
-  for _, entry in ipairs(snapshot.combined.order) do
-    local hay = (entry.displayName .. " " .. entry.name):lower()
-    if hay:find(term, 1, true) then
-      found = found + 1
-      print(string.format("%2d) %s = %s | Lokal %s | ME %s", found, entry.displayName, formatCount(entry.totalCount), formatCount(entry.localCount), formatCount(entry.meCount)))
-      if found >= 20 then
-        break
-      end
-    end
-  end
-
-  if found == 0 then
-    print("Keine Treffer.")
-  end
-end
-
-local function showMonitorStatus()
-  local name = resolveMonitorName()
-  local area, width, height = monitorArea(name)
-  printSection("Monitor")
-  print("Monitor:       " .. (name or "aus / keiner gefunden"))
-  if name then
-    print("Groesse:       " .. tostring(width) .. "x" .. tostring(height) .. " Zeichen (" .. formatCount(area) .. ")")
-    print("Auto-Auswahl:  waehlt den groessten gefundenen Monitor")
-  end
-  print("Skalierung:    " .. tostring(state.config.monitorScale))
-  print("Scan Intervall:" .. " " .. tostring(state.config.scanInterval) .. "s")
-  print("Seitenwechsel: " .. tostring(state.config.pageInterval) .. "s")
-end
-
-local function showHelp()
-  printSection("Auto-Sortierung + Statistik")
-  print("Dieses Script sortiert automatisch aus Create Item Vaults.")
-  print("Nur Items, die bereits im Functional-Storage-Controller liegen,")
-  print("werden dorthin verschoben. Ueberschuss bleibt in den Vaults.")
-  print("")
-  print("Wichtige Befehle:")
-  print("  help / hilfe               - Hilfe anzeigen")
-  print("  status                     - Uebersicht")
-  print("  scan                       - sofort neu scannen")
-  print("  sort                       - Sortierung sofort ausfuehren")
-  print("  periph                     - erkannte Peripherals")
-  print("  vaults [auto|<name> ...]   - Vaults automatisch oder fest setzen")
-  print("  controller [auto|<name>]   - Functional-Storage-Controller setzen")
-  print("  mebridge [auto|off|<name>] - ME Bridge nur fuer Statistik setzen")
-  print("  monitor [auto|off|<name>]  - Monitor setzen")
-  print("  intervall <scan> [sort]    - Scan- und Sortierintervall")
-  print("  exit                       - Script beenden")
-  print("")
-  print("Marker in Slot 1:")
-  print("  LAGER:VAULT")
-  print("  LAGER:SOURCE")
-  print("  LAGER:PRIO")
-  print("  LAGER:IGNORE")
-end
-
-local function showSupportStatus()
-  local support = buildSupportStatus()
-  printSection("Auto-Sortierung")
-  print("Modus:           " .. (support.enabled and "AN" or "AUS"))
-  print("Vaults:          " .. formatCount(support.vaultCount or 0))
-  print("Controller:      " .. (support.priorityName or "nicht gefunden"))
-  print("ME Bridge:       " .. (support.meBridgeName or "nicht gefunden"))
-  print("Intervall:       " .. tostring(support.interval) .. "s")
-  print("Letzter Lauf:    " .. formatSince(support.lastRun))
-  print("Zum Controller:  " .. formatCount(support.lastMovedPriority or 0))
-  print("In Vaults:       " .. formatCount(support.lastStayed or 0))
-  print("Zuletzt bewegt:  " .. formatCount(support.lastMoved))
-  print("Hinweis:         " .. tostring(support.lastNote or "-"))
-  if support.vaultNames and #support.vaultNames > 0 then
-    print("Quellen:         " .. joinList(support.vaultNames, ", "))
-  end
-end
-
-local function handleVaultsCommand(args)
-  if not args[2] then
-    local names = resolveVaultNames()
-    if #names == 0 then
-      print("Vaults: keine gefunden")
+local function soundLoop()
+  while true do
+    if #soundQueue == 0 then
+      sleep(0.05)
     else
-      print("Vaults (" .. tostring(#names) .. "): " .. joinList(names, ", "))
-    end
-    return
-  end
-
-  local sub = tostring(args[2]):lower()
-  if sub == "auto" or sub == "clear" then
-    state.config.vaultNames = nil
-    saveConfig()
-    scanAll(true)
-    print("Vaults werden jetzt automatisch gesucht.")
-    return
-  end
-
-  local names = {}
-  for i = 2, #args do
-    local name = args[i]
-    if not (peripheral.isPresent(name) and hasType(name, "inventory")) then
-      print("Inventar '" .. tostring(name) .. "' nicht gefunden.")
-      return
-    end
-    names[#names + 1] = name
-  end
-
-  if #names == 0 then
-    print("Bitte mindestens einen Vault-Namen angeben.")
-    return
-  end
-
-  state.config.vaultNames = names
-  saveConfig()
-  scanAll(true)
-  print("Vaults gesetzt auf: " .. joinList(names, ", "))
-end
-
-local function handlePriorityCommand(args)
-  if not args[2] then
-    print("Controller: " .. (resolvePriorityName() or "nicht gefunden"))
-    return
-  end
-
-  local sub = tostring(args[2]):lower()
-  if sub == "auto" then
-    state.config.priorityName = nil
-    saveConfig()
-    scanAll(true)
-    print("Controller wird jetzt automatisch gesucht.")
-    return
-  end
-
-  local name = args[2]
-  if peripheral.isPresent(name) and hasType(name, "inventory") then
-    state.config.priorityName = name
-    saveConfig()
-    scanAll(true)
-    print("Controller gesetzt auf " .. name)
-  else
-    print("Inventar '" .. tostring(name) .. "' nicht gefunden.")
-  end
-end
-
-local function handleSupportCommand(args)
-  if not args[2] then
-    showSupportStatus()
-    return
-  end
-
-  local sub = tostring(args[2]):lower()
-  if sub == "on" then
-    state.config.supportEnabled = true
-    saveConfig()
-    scanAll(true)
-    renderMonitor()
-    print("Auto-Sortierung aktiviert.")
-    return
-  end
-
-  if sub == "off" then
-    state.config.supportEnabled = false
-    saveConfig()
-    scanAll(true)
-    renderMonitor()
-    print("Auto-Sortierung deaktiviert.")
-    return
-  end
-
-  if sub == "run" or sub == "einsortieren" then
-    local moved = runSupportMove(false)
-    if moved > 0 then
-      scanAll(true)
-      renderMonitor()
-    end
-    return
-  end
-
-  if sub == "interval" or sub == "intervall" then
-    local sec = tonumber(args[3] or "")
-    if not sec then
-      print("Bitte Sekunden angeben.")
-      return
-    end
-    state.config.supportInterval = math.max(1, math.floor(sec))
-    saveConfig()
-    scanAll(true)
-    print("Sortier-Intervall gesetzt auf " .. tostring(state.config.supportInterval) .. "s")
-    return
-  end
-
-  showSupportStatus()
-end
-
-local function handleMonitorCommand(args)
-  if not args[2] then
-    showMonitorStatus()
-    return
-  end
-
-  local sub = tostring(args[2]):lower()
-
-  if sub == "off" then
-    state.config.monitorDisabled = true
-    state.config.monitorName = nil
-    saveConfig()
-    scanAll(true)
-    print("Monitor deaktiviert.")
-    return
-  end
-
-  if sub == "auto" then
-    state.config.monitorDisabled = false
-    state.config.monitorName = nil
-    saveConfig()
-    scanAll(true)
-    renderMonitor()
-    print("Monitor wird jetzt automatisch gesucht.")
-    return
-  end
-
-  if sub == "scale" then
-    local value = tonumber(args[3] or "")
-    if not value then
-      print("Bitte gueltigen Zahlenwert angeben, z.B. 0.5")
-      return
-    end
-
-    state.config.monitorScale = value
-    saveConfig()
-    renderMonitor()
-    print("Monitor-Skalierung gesetzt auf " .. tostring(value))
-    return
-  end
-
-  local name = args[2]
-  if peripheral.isPresent(name) and hasType(name, "monitor") then
-    state.config.monitorDisabled = false
-    state.config.monitorName = name
-    saveConfig()
-    scanAll(true)
-    renderMonitor()
-    print("Monitor gesetzt auf " .. name)
-  else
-    print("Monitor '" .. tostring(name) .. "' nicht gefunden.")
-  end
-end
-
-local function handleMeBridgeCommand(args)
-  if not args[2] then
-    printSection("ME Bridge")
-    print("ME Bridge: " .. (resolveMeBridgeName() or "aus / keine gefunden"))
-    return
-  end
-
-  local sub = tostring(args[2]):lower()
-
-  if sub == "off" then
-    state.config.meBridgeDisabled = true
-    state.config.meBridgeName = nil
-    saveConfig()
-    scanAll(true)
-    renderMonitor()
-    print("ME Bridge deaktiviert.")
-    return
-  end
-
-  if sub == "auto" then
-    state.config.meBridgeDisabled = false
-    state.config.meBridgeName = nil
-    saveConfig()
-    scanAll(true)
-    renderMonitor()
-    print("ME Bridge wird jetzt automatisch gesucht.")
-    return
-  end
-
-  local name = args[2]
-  if peripheral.isPresent(name) and isMEBridgeName(name) then
-    state.config.meBridgeDisabled = false
-    state.config.meBridgeName = name
-    saveConfig()
-    scanAll(true)
-    renderMonitor()
-    print("ME Bridge gesetzt auf " .. name)
-  else
-    print("ME Bridge '" .. tostring(name) .. "' nicht gefunden.")
-  end
-end
-
-local function handleIntervalCommand(args)
-  local scanValue = tonumber(args[2] or "")
-  local sortValue = tonumber(args[3] or "")
-
-  if not scanValue then
-    print("Bitte mindestens das Scan-Intervall angeben.")
-    return
-  end
-
-  state.config.scanInterval = math.max(2, math.floor(scanValue))
-  if sortValue then
-    state.config.supportInterval = math.max(1, math.floor(sortValue))
-  end
-
-  saveConfig()
-  print("Intervalle gesetzt: Scan " .. tostring(state.config.scanInterval) .. "s | Sortierung " .. tostring(state.config.supportInterval) .. "s")
-end
-
-local function handlePageCommand(args)
-  local pages = buildMonitorPages(state.snapshot)
-  if #pages == 0 then
-    print("Keine Monitorseiten vorhanden.")
-    return
-  end
-
-  if not args[2] then
-    print("Aktuelle Seite: " .. tostring(state.page) .. "/" .. tostring(#pages) .. " - " .. pages[state.page].title)
-    return
-  end
-
-  local sub = tostring(args[2]):lower()
-  if sub == "next" then
-    state.page = state.page + 1
-    if state.page > #pages then
-      state.page = 1
-    end
-  elseif sub == "prev" then
-    state.page = state.page - 1
-    if state.page < 1 then
-      state.page = #pages
-    end
-  else
-    local pageNumber = tonumber(sub)
-    if not pageNumber then
-      print("Bitte Seitenzahl, 'next' oder 'prev' angeben.")
-      return
-    end
-    state.page = math.max(1, math.min(#pages, math.floor(pageNumber)))
-  end
-
-  state.lastPageSwitch = nowMs()
-  renderMonitor()
-  print("Seite: " .. tostring(state.page) .. "/" .. tostring(#pages) .. " - " .. pages[state.page].title)
-end
-
-local function handleCommand(line)
-  line = trim(line)
-  if line == "" then
-    return true
-  end
-
-  local args = {}
-  for token in line:gmatch("%S+") do
-    args[#args + 1] = token
-  end
-
-  local cmd = tostring(args[1] or ""):lower()
-
-  if cmd == "help" or cmd == "hilfe" then
-    showHelp()
-  elseif cmd == "scan" or cmd == "refresh" then
-    scanAll(false)
-    renderMonitor()
-  elseif cmd == "status" then
-    showStatus()
-  elseif cmd == "sort" or cmd == "einsortieren" then
-    local moved = runSupportMove(false)
-    if moved > 0 then
-      scanAll(true)
-      renderMonitor()
-    end
-  elseif cmd == "periph" or cmd == "peripherals" then
-    showPeripherals()
-  elseif cmd == "vaults" or cmd == "vault" or cmd == "quelle" or cmd == "quellen" then
-    handleVaultsCommand(args)
-  elseif cmd == "controller" or cmd == "prio" then
-    handlePriorityCommand(args)
-  elseif cmd == "mebridge" then
-    handleMeBridgeCommand(args)
-  elseif cmd == "monitor" then
-    handleMonitorCommand(args)
-  elseif cmd == "intervall" or cmd == "interval" then
-    handleIntervalCommand(args)
-  elseif cmd == "support" then
-    showSupportStatus()
-  elseif cmd == "me" then
-    showMe()
-  elseif cmd == "energy" or cmd == "strom" then
-    showEnergy()
-  elseif cmd == "exit" or cmd == "quit" or cmd == "ende" then
-    state.running = false
-    return false
-  else
-    print("Unbekannter Befehl: " .. cmd)
-    print("Mit 'help' bekommst du die kurzen Befehle.")
-  end
-
-  return true
-end
-
-local function backgroundLoop()
-  while state.running do
-    local now = nowMs()
-    state.tick = state.tick + 1
-
-    local supportMoved = 0
-    if state.config.supportEnabled and (now - state.lastSupportRun >= (state.config.supportInterval * 1000)) then
-      supportMoved = runSupportMove(true)
-    end
-
-    if (not state.snapshot) or supportMoved > 0 or (now - state.lastScan >= (state.config.scanInterval * 1000)) then
-      scanAll(true)
-    end
-
-    if state.snapshot then
-      local pages = buildMonitorPages(state.snapshot)
-      if #pages > 1 and (now - state.lastPageSwitch >= (state.config.pageInterval * 1000)) then
-        state.page = state.page + 1
-        if state.page > #pages then
-          state.page = 1
-        end
-        state.lastPageSwitch = now
+      local event = table.remove(soundQueue, 1)
+      if event.delay and event.delay > 0 then sleep(event.delay) end
+      if event.kind == "note" then
+        playNoteAll(event.inst, event.vol, event.pitch)
+      elseif event.kind == "sound" then
+        playSoundAll(event.name, event.vol, event.pitch)
       end
-    end
-
-    renderMonitor()
-    sleep(1)
-  end
-end
-
-local function commandLoop()
-  print("Lager Auto-Sortierung gestartet.")
-  print("Vaults -> Controller fuer priorisierte Items. Ueberschuss bleibt in den Vaults.")
-  print("ME Bridge und Monitor dienen weiter fuer Statistik, wenn vorhanden.")
-  print("Mit 'help' bekommst du die kurzen Befehle.")
-  print("")
-
-  scanAll(true)
-  renderMonitor()
-  showStatus()
-
-  while state.running do
-    write("stats> ")
-    local line = read()
-    if line == nil then
-      break
-    end
-    if not handleCommand(line) then
-      break
+      sleep(0.02)
     end
   end
 end
 
-loadConfig()
-state.config.supportEnabled = true
-state.lastPageSwitch = nowMs()
-parallel.waitForAny(commandLoop, backgroundLoop)
+local function cleanup()
+  for i = 1, #speakers do
+    pcall(speakers[i].obj.stop)
+  end
+  for i = 1, #monitors do
+    local mon = monitors[i].obj
+    clear(mon, colors.black)
+    centerWrite(mon, math.floor(monitors[i].h / 2), "ChronoShow beendet", colors.white, colors.black)
+  end
+end
+
+local function touchLoop()
+  while true do
+    local ev, a, b, c = os.pullEvent()
+    if ev == "monitor_touch" then
+      queueTouchPling()
+      local now = os.clock()
+      state.statusMessage = "Touch auf " .. tostring(a)
+      state.statusUntil = now + 3
+      state.touchTimes[#state.touchTimes + 1] = now
+      while #state.touchTimes > 0 and now - state.touchTimes[1] > CONFIG.touchWindow do
+        table.remove(state.touchTimes, 1)
+      end
+      if #state.touchTimes >= CONFIG.touchPartyCount then
+        state.touchTimes = {}
+        startParty("PARTY MODE AKTIV")
+      end
+    elseif ev == "monitor_resize" or ev == "peripheral" or ev == "peripheral_detach" then
+      rescanPeripherals()
+    elseif ev == "terminate" then
+      cleanup()
+      error("Terminated", 0)
+    end
+  end
+end
+
+math.randomseed(os.epoch("utc") or os.time())
+rescanPeripherals()
+bootSequence()
+parallel.waitForAny(renderLoop, soundLoop, touchLoop)
