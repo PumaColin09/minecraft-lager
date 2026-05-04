@@ -19,7 +19,7 @@ local startupOutputFlow = 3000000
 -- please leave things untouched from here on
 os.loadAPI("lib/f")
 
-local version = "0.31-remote-modem"
+local version = "0.32-manual-fallback"
 
 -- toggleable via the monitor, use our algorithm to achieve our target field strength or let the user tweak it
 local autoInputGate  = 1
@@ -59,6 +59,7 @@ local emergencyCharge = false
 local emergencyTemp   = false
 local newReactorChecked = false
 local reactorDiagnostics = {}
+local manualArmUntil = 0
 
 local function numberOr(value, fallback)
   local parsed = tonumber(value)
@@ -461,6 +462,36 @@ function buttons()
     local event, side, xPos, yPos = os.pullEvent("monitor_touch")
 
     ----------------------------------------------------------------
+    -- MANUAL FALLBACK: shown when getReactorInfo() returns nil.
+    -- STOP is always available. CHARGE/ACTIVATE require ARM first.
+    ----------------------------------------------------------------
+    if ri == nil then
+      if yPos == 13 and xPos >= 2 and xPos <= 9 then
+        manualArmUntil = os.clock() + 10
+        action = "Manual armed"
+      elseif yPos == 11 and xPos >= 2 and xPos <= 7 then
+        callReactor("stopReactor")
+        action = "Manual stop"
+      elseif yPos == 11 and xPos >= 10 and xPos <= 17 then
+        if os.clock() < manualArmUntil then
+          callReactor("chargeReactor")
+          action = "Manual charge"
+          manualArmUntil = 0
+        else
+          action = "Arm before charge"
+        end
+      elseif yPos == 11 and xPos >= 20 and xPos <= 27 then
+        if os.clock() < manualArmUntil then
+          callReactor("activateReactor")
+          action = "Manual activate"
+          manualArmUntil = 0
+        else
+          action = "Arm before activate"
+        end
+      end
+    end
+
+    ----------------------------------------------------------------
     -- OUTPUT GATE: manual controls + AU/MA toggle on row 8
     ----------------------------------------------------------------
     -- 2-4 = -1000, 6-9 = -10000, 10-12 = -100000
@@ -590,11 +621,21 @@ function update()
       f.draw_text(mon, 2, 4, "getReactorInfo() is nil", colors.white, colors.black)
       f.draw_text(mon, 2, 6, "Reactor: " .. tostring(reactorName or "none"), colors.orange, colors.black)
       f.draw_text(mon, 2, 7, "Call: " .. tostring(reactorCallMode or "none"), colors.orange, colors.black)
-      f.draw_text(mon, 2, 9, "Autoscan retrying", colors.gray, colors.black)
+      f.draw_text(mon, 2, 9, "Manual only - no sensors", colors.yellow, colors.black)
+      f.draw_text(mon, 2, 11, "STOP", colors.white, colors.red)
+      f.draw_text(mon, 10, 11, "CHARGE", colors.white, colors.gray)
+      f.draw_text(mon, 20, 11, "ACTIVATE", colors.white, colors.gray)
+      if os.clock() < manualArmUntil then
+        f.draw_text(mon, 2, 13, "ARMED", colors.black, colors.yellow)
+      else
+        f.draw_text(mon, 2, 13, "ARM", colors.white, colors.gray)
+      end
+      f.draw_text(mon, 2, 15, "Action: " .. action, colors.gray, colors.black)
+      f.draw_text(mon, 2, 17, "Autoscan retrying", colors.gray, colors.black)
       win.setVisible(true)
       win.redraw()
       win.setVisible(false)
-      sleep(5)
+      sleep(1)
     end
 
     if ri ~= nil then

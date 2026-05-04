@@ -43,3 +43,5 @@ probe draconic_reactor_0
 ```
 
 `probe` checks direct `peripheral.call(...)`, wrapped calls, and old-style wired modem `callRemote(...)`. The controller tries the direct path and then wired modem remote paths.
+
+If reactor info is still unavailable, the monitor enters manual fallback mode. In that mode `STOP` is always available, while `CHARGE` and `ACTIVATE` require pressing `ARM` first. Automatic regulation is disabled until `getReactorInfo()` returns real sensor data.
