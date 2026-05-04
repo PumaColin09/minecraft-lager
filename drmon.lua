@@ -19,7 +19,7 @@ local startupOutputFlow = 3000000
 -- please leave things untouched from here on
 os.loadAPI("lib/f")
 
-local version = "0.27-diagnostics"
+local version = "0.28-autoscan"
 
 -- toggleable via the monitor, use our algorithm to achieve our target field strength or let the user tweak it
 local autoInputGate  = 1
@@ -43,6 +43,7 @@ local mon, monitor, monX, monY
 
 -- peripherals
 local reactor
+local reactorName
 local fluxgate
 local inputfluxgate
 local relay
@@ -55,6 +56,7 @@ local action = "None since reboot"
 local emergencyCharge = false
 local emergencyTemp   = false
 local newReactorChecked = false
+local reactorDiagnostics = {}
 
 local function numberOr(value, fallback)
   local parsed = tonumber(value)
@@ -103,11 +105,74 @@ local function isFluxGate(gate)
   return gate ~= nil and gate.getSignalLowFlow ~= nil and gate.setSignalLowFlow ~= nil
 end
 
-monitor      = f.periphSearch("monitor")
-reactor      = peripheral.wrap(reactorSide)
-if reactor == nil or reactor.getReactorInfo == nil then
-  reactor = f.periphSearch("draconic_reactor")
+local function findReactor()
+  local candidates = {}
+  local seen = {}
+
+  local function addCandidate(name, source)
+    if name == nil or seen[name] == true then
+      return
+    end
+    seen[name] = true
+
+    local candidate = peripheral.wrap(name)
+    if candidate ~= nil and candidate.getReactorInfo ~= nil then
+      candidates[#candidates + 1] = {
+        name = name,
+        source = source,
+        type = tostring(peripheral.getType(name)),
+        reactor = candidate,
+      }
+    end
+  end
+
+  addCandidate(reactorSide, "configured")
+
+  for i, name in ipairs(peripheral.getNames()) do
+    local candidate = peripheral.wrap(name)
+    if peripheral.getType(name) == "draconic_reactor" or (candidate ~= nil and candidate.getReactorInfo ~= nil) then
+      addCandidate(name, "detected")
+    end
+  end
+
+  reactorDiagnostics = {}
+  for i, candidate in ipairs(candidates) do
+    local ok, info = pcall(candidate.reactor.getReactorInfo)
+    local message = "getReactorInfo() returned nil"
+
+    if ok == false then
+      message = "getReactorInfo() error: " .. tostring(info)
+    elseif info ~= nil then
+      reactorDiagnostics[#reactorDiagnostics + 1] = candidate.name .. " [" .. candidate.type .. "]: OK"
+      return candidate.reactor, candidate.name, info
+    end
+
+    reactorDiagnostics[#reactorDiagnostics + 1] = candidate.name .. " [" .. candidate.type .. "]: " .. message
+  end
+
+  if candidates[1] ~= nil then
+    return candidates[1].reactor, candidates[1].name, nil
+  end
+
+  return nil, nil, nil
 end
+
+local function readReactorInfo()
+  local info = nil
+
+  if reactor ~= nil and reactor.getReactorInfo ~= nil then
+    local ok, result = pcall(reactor.getReactorInfo)
+    if ok and result ~= nil then
+      return result
+    end
+  end
+
+  reactor, reactorName, info = findReactor()
+  return info
+end
+
+monitor      = f.periphSearch("monitor")
+reactor, reactorName, ri = findReactor()
 inputfluxgate = peripheral.wrap(inputfluxgateSide)
 fluxgate     = peripheral.wrap(fluxgateSide)
 relay        = peripheral.wrap(relaySide)
@@ -124,7 +189,7 @@ if isFluxGate(fluxgate) == false then
 end
 
 if reactor == nil then
-  error("No valid reactor was found")
+  error("No reactor peripheral was found. Check modem/cable and the reactor connection.")
 end
 
 if isFluxGate(inputfluxgate) == false then
@@ -295,7 +360,7 @@ function update()
 
     f.clear(mon)
 
-    ri = reactor.getReactorInfo()
+    ri = readReactorInfo()
 
     -- print out all the infos from .getReactorInfo() to term
 
@@ -311,6 +376,17 @@ function update()
       print("Check that the Draconic Reactor multiblock is complete and valid.")
       print("Check that the computer can reach the real reactor peripheral.")
       print("")
+      print("Selected reactor: " .. tostring(reactorName or "none"))
+      print("")
+      print("Reactor candidates:")
+      if #reactorDiagnostics == 0 then
+        print("none")
+      else
+        for i, line in ipairs(reactorDiagnostics) do
+          print(line)
+        end
+      end
+      print("")
       print("Detected peripherals:")
       for i, name in ipairs(peripheral.getNames()) do
         print(name .. ": " .. tostring(peripheral.getType(name)))
@@ -318,9 +394,9 @@ function update()
 
       f.draw_text(mon, 2, 2, "Reactor Setup Invalid", colors.red, colors.black)
       f.draw_text(mon, 2, 4, "getReactorInfo() is nil", colors.white, colors.black)
-      f.draw_text(mon, 2, 6, "Check multiblock", colors.orange, colors.black)
-      f.draw_text(mon, 2, 7, "Check reactor peripheral", colors.orange, colors.black)
-      f.draw_text(mon, 2, 9, "Computer will retry", colors.gray, colors.black)
+      f.draw_text(mon, 2, 6, "Reactor: " .. tostring(reactorName or "none"), colors.orange, colors.black)
+      f.draw_text(mon, 2, 7, "Check terminal list", colors.orange, colors.black)
+      f.draw_text(mon, 2, 9, "Autoscan retrying", colors.gray, colors.black)
       win.setVisible(true)
       win.redraw()
       win.setVisible(false)

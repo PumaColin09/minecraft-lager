@@ -27,6 +27,8 @@ local relaySide = "bottom"
 
 If the monitor says `Reactor Setup Invalid`, the script found a reactor peripheral but `getReactorInfo()` returned `nil`. That usually means the Draconic Reactor multiblock is not complete/valid yet, or the ComputerCraft computer is connected to the wrong block/peripheral.
 
+The current installer auto-scans all detected reactor candidates and prints their result on the terminal. Look for a line like `name [draconic_reactor]: getReactorInfo() returned nil`; that tells you which connection is being rejected by Draconic Evolution.
+
 Useful in-game check:
 
 ```lua
