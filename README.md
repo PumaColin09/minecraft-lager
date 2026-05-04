@@ -34,3 +34,10 @@ Useful in-game check:
 ```lua
 for _, name in ipairs(peripheral.getNames()) do print(name, peripheral.getType(name)) end
 ```
+
+For a full stabilizer API probe:
+
+```text
+wget https://raw.githubusercontent.com/PumaColin09/minecraft-lager/main/probe.lua probe
+probe draconic_reactor_0
+```

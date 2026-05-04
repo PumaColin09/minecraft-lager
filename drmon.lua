@@ -19,7 +19,7 @@ local startupOutputFlow = 3000000
 -- please leave things untouched from here on
 os.loadAPI("lib/f")
 
-local version = "0.28-autoscan"
+local version = "0.29-methods"
 
 -- toggleable via the monitor, use our algorithm to achieve our target field strength or let the user tweak it
 local autoInputGate  = 1
@@ -105,6 +105,16 @@ local function isFluxGate(gate)
   return gate ~= nil and gate.getSignalLowFlow ~= nil and gate.setSignalLowFlow ~= nil
 end
 
+local function describeMethods(name)
+  local ok, methods = pcall(peripheral.getMethods, name)
+  if ok == false or methods == nil then
+    return "methods unavailable"
+  end
+
+  table.sort(methods)
+  return table.concat(methods, ", ")
+end
+
 local function findReactor()
   local candidates = {}
   local seen = {}
@@ -144,10 +154,12 @@ local function findReactor()
       message = "getReactorInfo() error: " .. tostring(info)
     elseif info ~= nil then
       reactorDiagnostics[#reactorDiagnostics + 1] = candidate.name .. " [" .. candidate.type .. "]: OK"
+      reactorDiagnostics[#reactorDiagnostics + 1] = "methods: " .. describeMethods(candidate.name)
       return candidate.reactor, candidate.name, info
     end
 
     reactorDiagnostics[#reactorDiagnostics + 1] = candidate.name .. " [" .. candidate.type .. "]: " .. message
+    reactorDiagnostics[#reactorDiagnostics + 1] = "methods: " .. describeMethods(candidate.name)
   end
 
   if candidates[1] ~= nil then
