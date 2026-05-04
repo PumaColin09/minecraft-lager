@@ -19,7 +19,7 @@ local startupOutputFlow = 3000000
 -- please leave things untouched from here on
 os.loadAPI("lib/f")
 
-local version = "0.29-methods"
+local version = "0.30-callpath"
 
 -- toggleable via the monitor, use our algorithm to achieve our target field strength or let the user tweak it
 local autoInputGate  = 1
@@ -115,9 +115,65 @@ local function describeMethods(name)
   return table.concat(methods, ", ")
 end
 
+local function hasMethod(name, method)
+  local ok, methods = pcall(peripheral.getMethods, name)
+  if ok == false or methods == nil then
+    return false
+  end
+
+  for i, candidate in ipairs(methods) do
+    if candidate == method then
+      return true
+    end
+  end
+
+  return false
+end
+
+local function getReactorInfoByName(name)
+  if name == nil or hasMethod(name, "getReactorInfo") == false then
+    return false, nil, "getReactorInfo method missing"
+  end
+
+  local ok, info = pcall(peripheral.call, name, "getReactorInfo")
+  if ok == false then
+    return false, nil, tostring(info)
+  end
+
+  if info == nil then
+    return true, nil, "returned nil"
+  end
+
+  return true, info, "OK"
+end
+
+local function callReactor(method, ...)
+  if reactorName ~= nil and hasMethod(reactorName, method) then
+    local ok, result = pcall(peripheral.call, reactorName, method, ...)
+    if ok then
+      return result
+    end
+    action = method .. " failed"
+    print(method .. " failed: " .. tostring(result))
+    return nil
+  end
+
+  if reactor ~= nil and reactor[method] ~= nil then
+    local ok, result = pcall(reactor[method], ...)
+    if ok then
+      return result
+    end
+    action = method .. " failed"
+    print(method .. " failed: " .. tostring(result))
+  end
+
+  return nil
+end
+
 local function findReactor()
   local candidates = {}
   local seen = {}
+  local localSides = { "top", "bottom", "left", "right", "front", "back" }
 
   local function addCandidate(name, source)
     if name == nil or seen[name] == true then
@@ -125,40 +181,45 @@ local function findReactor()
     end
     seen[name] = true
 
-    local candidate = peripheral.wrap(name)
-    if candidate ~= nil and candidate.getReactorInfo ~= nil then
+    if hasMethod(name, "getReactorInfo") then
       candidates[#candidates + 1] = {
         name = name,
         source = source,
         type = tostring(peripheral.getType(name)),
-        reactor = candidate,
+        reactor = peripheral.wrap(name),
       }
     end
   end
 
   addCandidate(reactorSide, "configured")
 
+  for i, side in ipairs(localSides) do
+    addCandidate(side, "side")
+  end
+
   for i, name in ipairs(peripheral.getNames()) do
-    local candidate = peripheral.wrap(name)
-    if peripheral.getType(name) == "draconic_reactor" or (candidate ~= nil and candidate.getReactorInfo ~= nil) then
+    if peripheral.getType(name) == "draconic_reactor" or hasMethod(name, "getReactorInfo") then
       addCandidate(name, "detected")
     end
   end
 
   reactorDiagnostics = {}
   for i, candidate in ipairs(candidates) do
-    local ok, info = pcall(candidate.reactor.getReactorInfo)
-    local message = "getReactorInfo() returned nil"
+    local ok, info, message = getReactorInfoByName(candidate.name)
 
     if ok == false then
-      message = "getReactorInfo() error: " .. tostring(info)
+      message = "getReactorInfo() error: " .. tostring(message)
     elseif info ~= nil then
       reactorDiagnostics[#reactorDiagnostics + 1] = candidate.name .. " [" .. candidate.type .. "]: OK"
+      reactorDiagnostics[#reactorDiagnostics + 1] = "source: " .. candidate.source .. ", call: peripheral.call"
       reactorDiagnostics[#reactorDiagnostics + 1] = "methods: " .. describeMethods(candidate.name)
       return candidate.reactor, candidate.name, info
+    else
+      message = "getReactorInfo() " .. tostring(message)
     end
 
     reactorDiagnostics[#reactorDiagnostics + 1] = candidate.name .. " [" .. candidate.type .. "]: " .. message
+    reactorDiagnostics[#reactorDiagnostics + 1] = "source: " .. candidate.source .. ", call: peripheral.call"
     reactorDiagnostics[#reactorDiagnostics + 1] = "methods: " .. describeMethods(candidate.name)
   end
 
@@ -172,8 +233,8 @@ end
 local function readReactorInfo()
   local info = nil
 
-  if reactor ~= nil and reactor.getReactorInfo ~= nil then
-    local ok, result = pcall(reactor.getReactorInfo)
+  if reactorName ~= nil then
+    local ok, result = getReactorInfoByName(reactorName)
     if ok and result ~= nil then
       return result
     end
@@ -517,7 +578,7 @@ function update()
     -- actual reactor interaction
     ----------------------------------------------------------------
     if emergencyCharge == true then
-      reactor.chargeReactor()
+      callReactor("chargeReactor")
     end
     
     -- are we charging? open the floodgates
@@ -528,13 +589,13 @@ function update()
 
     -- are we stopping from a shutdown and our temp is better? activate
     if emergencyTemp == true and (status == "stopping" or status == "cold") and temperature < safeTemperature then
-      reactor.activateReactor()
+      callReactor("activateReactor")
       emergencyTemp = false
     end
 
     -- are we charged? lets activate
     if (status == "charged" or (status == "warming_up" and temperature >= 2000)) and activateOnCharged == 1 then
-      reactor.activateReactor()
+      callReactor("activateReactor")
     end
 
     -- are we on? regulate the input fludgate to our target field strength
@@ -592,21 +653,21 @@ function update()
     ----------------------------------------------------------------
     -- out of fuel, kill it
     if fuelPercent <= 20 then
-      reactor.stopReactor()
+      callReactor("stopReactor")
       action = "Fuel below 20%, refuel"
     end
 
     -- field strength is too dangerous, kill and try and charge it before it blows
     if fieldPercent <= lowestFieldPercent and status == "running" then
       action = "Field Str < " .. lowestFieldPercent .. "%"
-      reactor.stopReactor()
-      reactor.chargeReactor()
+      callReactor("stopReactor")
+      callReactor("chargeReactor")
       emergencyCharge = true
     end
 
     -- temperature too high, kill it and activate it when its cool
     if temperature > maxTemperature then
-      reactor.stopReactor()
+      callReactor("stopReactor")
       action = "Temp > " .. maxTemperature
       emergencyTemp = true
     end

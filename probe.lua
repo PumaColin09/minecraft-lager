@@ -35,7 +35,20 @@ local function printPeripheral(name)
   end
 
   print("")
-  print("Safe getter probes:")
+  print("Direct peripheral.call probes:")
+  for _, method in ipairs(methods) do
+    if isSafeMethod(method) then
+      local ok, a, b, c, d = pcall(peripheral.call, name, method)
+      if ok then
+        print("  " .. method .. " -> " .. safeSerialize({ a, b, c, d }))
+      else
+        print("  " .. method .. " ERROR -> " .. tostring(a))
+      end
+    end
+  end
+
+  print("")
+  print("Wrapped getter probes:")
   for _, method in ipairs(methods) do
     if isSafeMethod(method) and type(wrapped[method]) == "function" then
       local ok, a, b, c, d = pcall(wrapped[method])
@@ -59,6 +72,20 @@ end
 print("Detected peripherals:")
 for _, name in ipairs(peripheral.getNames()) do
   print(name .. " [" .. tostring(peripheral.getType(name)) .. "]")
+end
+
+print("")
+print("Local side probes:")
+for _, side in ipairs({ "top", "bottom", "left", "right", "front", "back" }) do
+  if peripheral.isPresent(side) then
+    print(side .. " [" .. tostring(peripheral.getType(side)) .. "]")
+    local methods = peripheral.getMethods(side) or {}
+    table.sort(methods)
+    print("  methods: " .. table.concat(methods, ", "))
+    if peripheral.hasType and peripheral.hasType(side, "draconic_reactor") then
+      print("  hasType draconic_reactor: true")
+    end
+  end
 end
 print("")
 print("Run with a name, for example:")

@@ -41,3 +41,5 @@ For a full stabilizer API probe:
 wget https://raw.githubusercontent.com/PumaColin09/minecraft-lager/main/probe.lua probe
 probe draconic_reactor_0
 ```
+
+`probe` checks both direct `peripheral.call(...)` and wrapped calls. The controller uses the direct call path first.
