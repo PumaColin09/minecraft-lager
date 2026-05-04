@@ -22,3 +22,13 @@ local fluxgateSide = "right"
 local inputfluxgateSide = "left"
 local relaySide = "bottom"
 ```
+
+## Reactor Setup Invalid
+
+If the monitor says `Reactor Setup Invalid`, the script found a reactor peripheral but `getReactorInfo()` returned `nil`. That usually means the Draconic Reactor multiblock is not complete/valid yet, or the ComputerCraft computer is connected to the wrong block/peripheral.
+
+Useful in-game check:
+
+```lua
+for _, name in ipairs(peripheral.getNames()) do print(name, peripheral.getType(name)) end
+```

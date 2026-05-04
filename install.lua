@@ -1,7 +1,7 @@
 -- ATM 10 Draconic Reactor Monitor safe installer
 -- Installs lib/f and startup, with backups for existing files.
 
-local version = "0.26-safe"
+local version = "0.27-diagnostics"
 
 local files = {
   { path = "lib/f", content = [=[-- peripheral identification
@@ -151,7 +151,7 @@ local startupOutputFlow = 3000000
 -- please leave things untouched from here on
 os.loadAPI("lib/f")
 
-local version = "0.26-safe"
+local version = "0.27-diagnostics"
 
 -- toggleable via the monitor, use our algorithm to achieve our target field strength or let the user tweak it
 local autoInputGate  = 1
@@ -432,9 +432,34 @@ function update()
     -- print out all the infos from .getReactorInfo() to term
 
     if ri == nil then
-      error("reactor has an invalid setup")
+      action = "Invalid reactor setup"
+
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.white)
+      term.clear()
+      term.setCursorPos(1,1)
+      print("Reactor setup invalid.")
+      print("getReactorInfo() returned nil.")
+      print("Check that the Draconic Reactor multiblock is complete and valid.")
+      print("Check that the computer can reach the real reactor peripheral.")
+      print("")
+      print("Detected peripherals:")
+      for i, name in ipairs(peripheral.getNames()) do
+        print(name .. ": " .. tostring(peripheral.getType(name)))
+      end
+
+      f.draw_text(mon, 2, 2, "Reactor Setup Invalid", colors.red, colors.black)
+      f.draw_text(mon, 2, 4, "getReactorInfo() is nil", colors.white, colors.black)
+      f.draw_text(mon, 2, 6, "Check multiblock", colors.orange, colors.black)
+      f.draw_text(mon, 2, 7, "Check reactor peripheral", colors.orange, colors.black)
+      f.draw_text(mon, 2, 9, "Computer will retry", colors.gray, colors.black)
+      win.setVisible(true)
+      win.redraw()
+      win.setVisible(false)
+      sleep(5)
     end
 
+    if ri ~= nil then
     local status = tostring(ri.status or "unknown")
     local temperature = numberOr(ri.temperature, 0)
 
@@ -675,6 +700,7 @@ function update()
     end
 
     sleep(0.1)
+    end
   end
 end
 
