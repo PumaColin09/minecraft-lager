@@ -61,11 +61,83 @@ local function printPeripheral(name)
   end
 end
 
+local function printRemotePeripheral(modemSide, remoteName)
+  local modem = peripheral.wrap(modemSide)
+  if modem == nil or modem.callRemote == nil then
+    return
+  end
+
+  local pType = "unknown"
+  if modem.getTypeRemote ~= nil then
+    local ok, result = pcall(modem.getTypeRemote, remoteName)
+    if ok then pType = tostring(result) end
+  end
+
+  print("")
+  print(remoteName .. " via modem " .. modemSide .. " [" .. pType .. "]")
+
+  local methods = {}
+  if modem.getMethodsRemote ~= nil then
+    local ok, result = pcall(modem.getMethodsRemote, remoteName)
+    if ok and result ~= nil then methods = result end
+  end
+  table.sort(methods)
+
+  print("Remote methods:")
+  for _, method in ipairs(methods) do
+    print("  " .. method)
+  end
+
+  print("")
+  print("Wired modem callRemote probes:")
+  for _, method in ipairs(methods) do
+    if isSafeMethod(method) then
+      local ok, a, b, c, d = pcall(modem.callRemote, remoteName, method)
+      if ok then
+        print("  " .. method .. " -> " .. safeSerialize({ a, b, c, d }))
+      else
+        print("  " .. method .. " ERROR -> " .. tostring(a))
+      end
+    end
+  end
+end
+
 if target ~= nil then
   if peripheral.isPresent(target) == false then
+    local foundRemote = false
+    for _, side in ipairs({ "top", "bottom", "left", "right", "front", "back" }) do
+      local modem = peripheral.wrap(side)
+      if modem ~= nil and modem.getNamesRemote ~= nil then
+        local ok, names = pcall(modem.getNamesRemote)
+        if ok and names ~= nil then
+          for _, remoteName in ipairs(names) do
+            if remoteName == target then
+              foundRemote = true
+              printRemotePeripheral(side, remoteName)
+            end
+          end
+        end
+      end
+    end
+    if foundRemote then
+      return
+    end
     error("Peripheral not found: " .. target)
   end
   printPeripheral(target)
+  for _, side in ipairs({ "top", "bottom", "left", "right", "front", "back" }) do
+    local modem = peripheral.wrap(side)
+    if modem ~= nil and modem.getNamesRemote ~= nil then
+      local ok, names = pcall(modem.getNamesRemote)
+      if ok and names ~= nil then
+        for _, remoteName in ipairs(names) do
+          if remoteName == target then
+            printRemotePeripheral(side, remoteName)
+          end
+        end
+      end
+    end
+  end
   return
 end
 
@@ -84,6 +156,17 @@ for _, side in ipairs({ "top", "bottom", "left", "right", "front", "back" }) do
     print("  methods: " .. table.concat(methods, ", "))
     if peripheral.hasType and peripheral.hasType(side, "draconic_reactor") then
       print("  hasType draconic_reactor: true")
+    end
+    local modem = peripheral.wrap(side)
+    if modem ~= nil and modem.getNamesRemote ~= nil then
+      local ok, names = pcall(modem.getNamesRemote)
+      if ok and names ~= nil then
+        table.sort(names)
+        print("  remote names: " .. table.concat(names, ", "))
+        for _, remoteName in ipairs(names) do
+          printRemotePeripheral(side, remoteName)
+        end
+      end
     end
   end
 end

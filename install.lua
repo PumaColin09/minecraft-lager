@@ -1,7 +1,7 @@
 -- ATM 10 Draconic Reactor Monitor safe installer
 -- Installs lib/f and startup, with backups for existing files.
 
-local version = "0.30-callpath"
+local version = "0.31-remote-modem"
 
 local files = {
   { path = "lib/f", content = [=[-- peripheral identification
@@ -151,7 +151,7 @@ local startupOutputFlow = 3000000
 -- please leave things untouched from here on
 os.loadAPI("lib/f")
 
-local version = "0.30-callpath"
+local version = "0.31-remote-modem"
 
 -- toggleable via the monitor, use our algorithm to achieve our target field strength or let the user tweak it
 local autoInputGate  = 1
@@ -176,6 +176,8 @@ local mon, monitor, monX, monY
 -- peripherals
 local reactor
 local reactorName
+local reactorCallMode
+local reactorModemSide
 local fluxgate
 local inputfluxgate
 local relay
@@ -262,12 +264,79 @@ local function hasMethod(name, method)
   return false
 end
 
-local function getReactorInfoByName(name)
-  if name == nil or hasMethod(name, "getReactorInfo") == false then
+local function getRemoteMethods(modemSide, remoteName)
+  local modem = peripheral.wrap(modemSide)
+  if modem == nil or modem.getMethodsRemote == nil then
+    return nil
+  end
+
+  local ok, methods = pcall(modem.getMethodsRemote, remoteName)
+  if ok == false then
+    return nil
+  end
+
+  return methods
+end
+
+local function hasRemoteMethod(modemSide, remoteName, method)
+  local methods = getRemoteMethods(modemSide, remoteName)
+  if methods == nil then
+    return false
+  end
+
+  for i, candidate in ipairs(methods) do
+    if candidate == method then
+      return true
+    end
+  end
+
+  return false
+end
+
+local function describeRemoteMethods(modemSide, remoteName)
+  local methods = getRemoteMethods(modemSide, remoteName)
+  if methods == nil then
+    return "remote methods unavailable"
+  end
+
+  table.sort(methods)
+  return table.concat(methods, ", ")
+end
+
+local function getRemoteType(modemSide, remoteName)
+  local modem = peripheral.wrap(modemSide)
+  if modem == nil or modem.getTypeRemote == nil then
+    return "unknown"
+  end
+
+  local ok, result = pcall(modem.getTypeRemote, remoteName)
+  if ok == false then
+    return "unknown"
+  end
+
+  return tostring(result)
+end
+
+local function getReactorInfoByPath(name, mode, modemSide)
+  if name == nil then
     return false, nil, "getReactorInfo method missing"
   end
 
-  local ok, info = pcall(peripheral.call, name, "getReactorInfo")
+  local ok, info
+
+  if mode == "remote" then
+    local modem = peripheral.wrap(modemSide)
+    if modem == nil or modem.callRemote == nil or hasRemoteMethod(modemSide, name, "getReactorInfo") == false then
+      return false, nil, "remote getReactorInfo method missing"
+    end
+    ok, info = pcall(modem.callRemote, name, "getReactorInfo")
+  else
+    if hasMethod(name, "getReactorInfo") == false then
+      return false, nil, "getReactorInfo method missing"
+    end
+    ok, info = pcall(peripheral.call, name, "getReactorInfo")
+  end
+
   if ok == false then
     return false, nil, tostring(info)
   end
@@ -280,6 +349,19 @@ local function getReactorInfoByName(name)
 end
 
 local function callReactor(method, ...)
+  if reactorName ~= nil and reactorCallMode == "remote" then
+    local modem = peripheral.wrap(reactorModemSide)
+    if modem ~= nil and modem.callRemote ~= nil and hasRemoteMethod(reactorModemSide, reactorName, method) then
+      local ok, result = pcall(modem.callRemote, reactorName, method, ...)
+      if ok then
+        return result
+      end
+      action = method .. " failed"
+      print(method .. " failed: " .. tostring(result))
+      return nil
+    end
+  end
+
   if reactorName ~= nil and hasMethod(reactorName, method) then
     local ok, result = pcall(peripheral.call, reactorName, method, ...)
     if ok then
@@ -307,16 +389,29 @@ local function findReactor()
   local seen = {}
   local localSides = { "top", "bottom", "left", "right", "front", "back" }
 
-  local function addCandidate(name, source)
-    if name == nil or seen[name] == true then
+  local function addCandidate(name, source, mode, modemSide)
+    mode = mode or "direct"
+    local key = mode .. ":" .. tostring(modemSide or "") .. ":" .. tostring(name or "")
+    if name == nil or seen[key] == true then
       return
     end
-    seen[name] = true
+    seen[key] = true
 
-    if hasMethod(name, "getReactorInfo") then
+    if mode == "remote" and hasRemoteMethod(modemSide, name, "getReactorInfo") then
       candidates[#candidates + 1] = {
         name = name,
         source = source,
+        mode = mode,
+        modemSide = modemSide,
+        type = getRemoteType(modemSide, name),
+        reactor = nil,
+      }
+    elseif mode ~= "remote" and hasMethod(name, "getReactorInfo") then
+      candidates[#candidates + 1] = {
+        name = name,
+        source = source,
+        mode = mode,
+        modemSide = nil,
         type = tostring(peripheral.getType(name)),
         reactor = peripheral.wrap(name),
       }
@@ -335,49 +430,71 @@ local function findReactor()
     end
   end
 
+  for i, side in ipairs(localSides) do
+    local modem = peripheral.wrap(side)
+    if modem ~= nil and modem.getNamesRemote ~= nil and modem.callRemote ~= nil then
+      local ok, names = pcall(modem.getNamesRemote)
+      if ok and names ~= nil then
+        for j, remoteName in ipairs(names) do
+          if getRemoteType(side, remoteName) == "draconic_reactor" or hasRemoteMethod(side, remoteName, "getReactorInfo") then
+            addCandidate(remoteName, "modem:" .. side, "remote", side)
+          end
+        end
+      end
+    end
+  end
+
   reactorDiagnostics = {}
   for i, candidate in ipairs(candidates) do
-    local ok, info, message = getReactorInfoByName(candidate.name)
+    local ok, info, message = getReactorInfoByPath(candidate.name, candidate.mode, candidate.modemSide)
 
     if ok == false then
       message = "getReactorInfo() error: " .. tostring(message)
     elseif info ~= nil then
       reactorDiagnostics[#reactorDiagnostics + 1] = candidate.name .. " [" .. candidate.type .. "]: OK"
-      reactorDiagnostics[#reactorDiagnostics + 1] = "source: " .. candidate.source .. ", call: peripheral.call"
-      reactorDiagnostics[#reactorDiagnostics + 1] = "methods: " .. describeMethods(candidate.name)
-      return candidate.reactor, candidate.name, info
+      reactorDiagnostics[#reactorDiagnostics + 1] = "source: " .. candidate.source .. ", call: " .. candidate.mode
+      if candidate.mode == "remote" then
+        reactorDiagnostics[#reactorDiagnostics + 1] = "methods: " .. describeRemoteMethods(candidate.modemSide, candidate.name)
+      else
+        reactorDiagnostics[#reactorDiagnostics + 1] = "methods: " .. describeMethods(candidate.name)
+      end
+      return candidate.reactor, candidate.name, info, candidate.mode, candidate.modemSide
     else
       message = "getReactorInfo() " .. tostring(message)
     end
 
     reactorDiagnostics[#reactorDiagnostics + 1] = candidate.name .. " [" .. candidate.type .. "]: " .. message
-    reactorDiagnostics[#reactorDiagnostics + 1] = "source: " .. candidate.source .. ", call: peripheral.call"
-    reactorDiagnostics[#reactorDiagnostics + 1] = "methods: " .. describeMethods(candidate.name)
+    reactorDiagnostics[#reactorDiagnostics + 1] = "source: " .. candidate.source .. ", call: " .. candidate.mode
+    if candidate.mode == "remote" then
+      reactorDiagnostics[#reactorDiagnostics + 1] = "methods: " .. describeRemoteMethods(candidate.modemSide, candidate.name)
+    else
+      reactorDiagnostics[#reactorDiagnostics + 1] = "methods: " .. describeMethods(candidate.name)
+    end
   end
 
   if candidates[1] ~= nil then
-    return candidates[1].reactor, candidates[1].name, nil
+    return candidates[1].reactor, candidates[1].name, nil, candidates[1].mode, candidates[1].modemSide
   end
 
-  return nil, nil, nil
+  return nil, nil, nil, nil, nil
 end
 
 local function readReactorInfo()
   local info = nil
 
   if reactorName ~= nil then
-    local ok, result = getReactorInfoByName(reactorName)
+    local ok, result = getReactorInfoByPath(reactorName, reactorCallMode, reactorModemSide)
     if ok and result ~= nil then
       return result
     end
   end
 
-  reactor, reactorName, info = findReactor()
+  reactor, reactorName, info, reactorCallMode, reactorModemSide = findReactor()
   return info
 end
 
 monitor      = f.periphSearch("monitor")
-reactor, reactorName, ri = findReactor()
+reactor, reactorName, ri, reactorCallMode, reactorModemSide = findReactor()
 inputfluxgate = peripheral.wrap(inputfluxgateSide)
 fluxgate     = peripheral.wrap(fluxgateSide)
 relay        = peripheral.wrap(relaySide)
@@ -393,7 +510,7 @@ if isFluxGate(fluxgate) == false then
   error("No valid output fluxgate was found on side '" .. fluxgateSide .. "'")
 end
 
-if reactor == nil then
+if reactorName == nil then
   error("No reactor peripheral was found. Check modem/cable and the reactor connection.")
 end
 
@@ -582,6 +699,10 @@ function update()
       print("Check that the computer can reach the real reactor peripheral.")
       print("")
       print("Selected reactor: " .. tostring(reactorName or "none"))
+      print("Call path: " .. tostring(reactorCallMode or "none"))
+      if reactorModemSide ~= nil then
+        print("Modem side: " .. tostring(reactorModemSide))
+      end
       print("")
       print("Reactor candidates:")
       if #reactorDiagnostics == 0 then
@@ -600,7 +721,7 @@ function update()
       f.draw_text(mon, 2, 2, "Reactor Setup Invalid", colors.red, colors.black)
       f.draw_text(mon, 2, 4, "getReactorInfo() is nil", colors.white, colors.black)
       f.draw_text(mon, 2, 6, "Reactor: " .. tostring(reactorName or "none"), colors.orange, colors.black)
-      f.draw_text(mon, 2, 7, "Check terminal list", colors.orange, colors.black)
+      f.draw_text(mon, 2, 7, "Call: " .. tostring(reactorCallMode or "none"), colors.orange, colors.black)
       f.draw_text(mon, 2, 9, "Autoscan retrying", colors.gray, colors.black)
       win.setVisible(true)
       win.redraw()

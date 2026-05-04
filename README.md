@@ -42,4 +42,4 @@ wget https://raw.githubusercontent.com/PumaColin09/minecraft-lager/main/probe.lu
 probe draconic_reactor_0
 ```
 
-`probe` checks both direct `peripheral.call(...)` and wrapped calls. The controller uses the direct call path first.
+`probe` checks direct `peripheral.call(...)`, wrapped calls, and old-style wired modem `callRemote(...)`. The controller tries the direct path and then wired modem remote paths.
